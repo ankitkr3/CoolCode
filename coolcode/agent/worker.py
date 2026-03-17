@@ -1,0 +1,170 @@
+"""Worker agents — 8 specialized types for the swarm."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any
+
+from deepagents import create_deep_agent
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import HumanMessage
+
+logger = logging.getLogger(__name__)
+
+
+class WorkerType(str, Enum):
+    """The 8 worker specializations."""
+
+    CODER = "coder"  # Writes and edits code
+    REVIEWER = "reviewer"  # Reviews code for quality, bugs, security
+    PLANNER = "planner"  # Breaks tasks into subtasks
+    RESEARCHER = "researcher"  # Searches codebase and docs
+    DEBUGGER = "debugger"  # Diagnoses and fixes bugs
+    TESTER = "tester"  # Writes and runs tests
+    REFACTORER = "refactorer"  # Improves code structure
+    SECURITY = "security"  # Security analysis and hardening
+
+
+# System prompt fragments per worker type
+WORKER_PROMPTS: dict[WorkerType, str] = {
+    WorkerType.CODER: (
+        "You are an expert software engineer. Write clean, efficient, production-ready code. "
+        "Follow existing patterns in the codebase. Keep changes minimal and focused. "
+        "Think step-by-step: understand the requirement, examine existing code, plan your change, implement it."
+    ),
+    WorkerType.REVIEWER: (
+        "You are a senior code reviewer. Analyze code for correctness, performance, security, "
+        "readability, and adherence to best practices. Be specific and actionable in your feedback. "
+        "Prioritize issues by severity: critical bugs > security > performance > style."
+    ),
+    WorkerType.PLANNER: (
+        "You are a software architect specializing in task decomposition. Break complex tasks into "
+        "clear, ordered subtasks. Identify dependencies, risks, and the critical path. "
+        "Each subtask should be independently completable and testable."
+    ),
+    WorkerType.RESEARCHER: (
+        "You are a codebase researcher. Thoroughly search and analyze code to understand structure, "
+        "patterns, and dependencies. Provide comprehensive context. Use file search, grep, and "
+        "directory listing to build a complete picture before answering."
+    ),
+    WorkerType.DEBUGGER: (
+        "You are an expert debugger. Systematically diagnose issues using the scientific method: "
+        "observe symptoms, form hypotheses, test them, narrow down root causes. "
+        "Always verify your fix doesn't introduce new issues."
+    ),
+    WorkerType.TESTER: (
+        "You are a testing specialist. Write comprehensive tests covering happy paths, edge cases, "
+        "error conditions, and boundary values. Prefer integration tests over mocks. "
+        "Ensure tests are deterministic and fast."
+    ),
+    WorkerType.REFACTORER: (
+        "You are a refactoring specialist. Improve code structure without changing behavior. "
+        "Focus on reducing duplication, improving naming, simplifying complex logic, and "
+        "extracting clear abstractions. Always ensure tests still pass after refactoring."
+    ),
+    WorkerType.SECURITY: (
+        "You are a security engineer. Analyze code for OWASP Top 10 vulnerabilities, injection "
+        "flaws, authentication issues, data exposure, and misconfigurations. "
+        "Provide specific, actionable remediation steps with code examples."
+    ),
+}
+
+
+@dataclass
+class WorkerResult:
+    """Result from a worker agent's execution."""
+
+    worker_id: str
+    worker_type: WorkerType
+    output: str
+    confidence: float = 0.8
+    elapsed_ms: float = 0.0
+    error: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def success(self) -> bool:
+        return self.error is None
+
+
+class WorkerAgent:
+    """A specialized worker agent in the swarm.
+
+    Each worker is a Deep Agent configured with a type-specific system prompt
+    and tools appropriate for its specialization.
+    """
+
+    def __init__(
+        self,
+        worker_id: str,
+        worker_type: WorkerType,
+        model: BaseChatModel | str = "anthropic:claude-sonnet-4-6",
+        tools: list | None = None,
+        extra_instructions: str = "",
+    ):
+        self.worker_id = worker_id
+        self.worker_type = worker_type
+
+        system_prompt = (
+            f"[Worker ID: {worker_id} | Type: {worker_type.value}]\n\n"
+            f"{WORKER_PROMPTS[worker_type]}\n\n"
+            f"{extra_instructions}\n\n"
+            "After completing your task, rate your confidence in your output from 0.0 to 1.0 "
+            "on the last line as: CONFIDENCE: <number>"
+        )
+
+        agent_kwargs: dict[str, Any] = {"system_prompt": system_prompt}
+        if isinstance(model, str):
+            agent_kwargs["model"] = model
+        else:
+            agent_kwargs["model"] = model
+        if tools:
+            agent_kwargs["tools"] = tools
+
+        self._agent = create_deep_agent(**agent_kwargs)
+
+    async def execute(self, task: str) -> WorkerResult:
+        """Execute a task and return the result."""
+        start = time.monotonic()
+        try:
+            result = await asyncio.to_thread(
+                self._agent.invoke,
+                {"messages": [{"role": "user", "content": task}]},
+            )
+            output = result["messages"][-1].content
+            elapsed = (time.monotonic() - start) * 1000
+
+            # Extract confidence from output
+            confidence = 0.8
+            lines = output.strip().split("\n")
+            for line in reversed(lines):
+                if line.strip().startswith("CONFIDENCE:"):
+                    try:
+                        confidence = float(line.split(":", 1)[1].strip())
+                        confidence = max(0.0, min(1.0, confidence))
+                    except ValueError:
+                        pass
+                    break
+
+            return WorkerResult(
+                worker_id=self.worker_id,
+                worker_type=self.worker_type,
+                output=output,
+                confidence=confidence,
+                elapsed_ms=elapsed,
+            )
+        except Exception as e:
+            elapsed = (time.monotonic() - start) * 1000
+            logger.error(f"Worker {self.worker_id} failed: {e}")
+            return WorkerResult(
+                worker_id=self.worker_id,
+                worker_type=self.worker_type,
+                output="",
+                confidence=0.0,
+                elapsed_ms=elapsed,
+                error=str(e),
+            )
