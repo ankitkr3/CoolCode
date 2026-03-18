@@ -49,8 +49,10 @@ AVAILABLE_MODELS: dict[str, list[dict[str, str]]] = {
         {"id": "claude-haiku-4-5-20251001", "name": "Claude Haiku 4.5", "tier": "Fastest"},
     ],
     "minimax": [
+        {"id": "MiniMax-M2.7-highspeed", "name": "MiniMax M2.7 Highspeed", "tier": "Fastest"},
+        {"id": "MiniMax-M2.7", "name": "MiniMax M2.7", "tier": "Best quality"},
         {"id": "MiniMax-M2.5", "name": "MiniMax M2.5", "tier": "Best value"},
-        {"id": "MiniMax-M2.5-Lightning", "name": "MiniMax M2.5 Lightning", "tier": "Fastest"},
+        {"id": "MiniMax-M2.5-highspeed", "name": "MiniMax M2.5 Highspeed", "tier": "Fast & cheap"},
     ],
 }
 
@@ -135,7 +137,7 @@ class CoolCodeConfig:
             providers.append(
                 LLMConfig(
                     provider="minimax",
-                    model=os.getenv("COOLCODE_MINIMAX_MODEL", saved_minimax.model if saved_minimax else "MiniMax-M2.5"),
+                    model=os.getenv("COOLCODE_MINIMAX_MODEL", saved_minimax.model if saved_minimax else "MiniMax-M2.7"),
                     api_key=minimax_key,
                     group_id=os.getenv("MINIMAX_GROUP_ID", saved_minimax.group_id if saved_minimax else ""),
                 )

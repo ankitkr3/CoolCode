@@ -19,8 +19,10 @@ COST_TABLE: dict[str, tuple[float, float]] = {
     "claude-opus-4-6": (15.0, 75.0),
     "claude-sonnet-4-6": (3.0, 15.0),
     "claude-haiku-4-5-20251001": (0.80, 4.0),
-    "MiniMax-M2.5": (0.15, 1.2),
-    "MiniMax-M2.5-Lightning": (0.3, 2.4),
+    "MiniMax-M2.7-highspeed": (0.5, 2.0),
+    "MiniMax-M2.7": (1.0, 4.0),
+    "MiniMax-M2.5": (0.15, 1.1),
+    "MiniMax-M2.5-highspeed": (0.3, 2.2),
 }
 
 
