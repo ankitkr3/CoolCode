@@ -133,15 +133,18 @@ class WorkerAgent:
         if self._status:
             self._status.emit(self.worker_id, action, detail)
 
-    async def execute(self, task: str) -> WorkerResult:
-        """Execute a task and return the result."""
+    async def execute(self, task: str, timeout: int = 120) -> WorkerResult:
+        """Execute a task and return the result. Times out after `timeout` seconds."""
         self._emit("started", f"working on: {task[:80]}...")
         start = time.monotonic()
         try:
             self._emit("thinking", "analyzing the task")
-            result = await asyncio.to_thread(
-                self._agent.invoke,
-                {"messages": [{"role": "user", "content": task}]},
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._agent.invoke,
+                    {"messages": [{"role": "user", "content": task}]},
+                ),
+                timeout=timeout,
             )
             output = result["messages"][-1].content
             elapsed = (time.monotonic() - start) * 1000
@@ -166,6 +169,18 @@ class WorkerAgent:
                 output=output,
                 confidence=confidence,
                 elapsed_ms=elapsed,
+            )
+        except (asyncio.TimeoutError, TimeoutError):
+            elapsed = (time.monotonic() - start) * 1000
+            self._emit("timeout", f"timed out after {timeout}s")
+            logger.warning(f"Worker {self.worker_id} timed out after {timeout}s")
+            return WorkerResult(
+                worker_id=self.worker_id,
+                worker_type=self.worker_type,
+                output="",
+                confidence=0.0,
+                elapsed_ms=elapsed,
+                error=f"Timed out after {timeout}s",
             )
         except Exception as e:
             elapsed = (time.monotonic() - start) * 1000

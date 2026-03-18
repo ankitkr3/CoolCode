@@ -88,14 +88,20 @@ class QueenAgent:
         types: list[WorkerType] = []
 
         # Keyword-based routing (fast path before LLM call)
+        # Order matters: researcher should match before planner for "architecture" queries
         routing_rules = {
-            WorkerType.DEBUGGER: ["bug", "fix", "error", "crash", "broken", "failing", "debug"],
-            WorkerType.TESTER: ["test", "spec", "coverage", "assert"],
-            WorkerType.SECURITY: ["security", "vulnerability", "cve", "owasp", "auth", "injection"],
-            WorkerType.REFACTORER: ["refactor", "clean up", "simplify", "restructure"],
-            WorkerType.REVIEWER: ["review", "audit", "check", "inspect"],
-            WorkerType.RESEARCHER: ["search", "find", "understand", "explain", "how does"],
-            WorkerType.PLANNER: ["plan", "design", "architect", "break down"],
+            WorkerType.RESEARCHER: [
+                "scan", "search", "find", "understand", "explain", "how does",
+                "tell me", "show me", "what is", "describe", "analyze", "analyse",
+                "architecture", "structure", "overview", "codebase", "folder",
+                "read", "look at", "explore", "walk through",
+            ],
+            WorkerType.DEBUGGER: ["bug", "fix", "error", "crash", "broken", "failing", "debug", "issue"],
+            WorkerType.TESTER: ["test", "spec", "coverage", "assert", "unit test"],
+            WorkerType.SECURITY: ["security", "vulnerability", "cve", "owasp", "auth", "injection", "xss"],
+            WorkerType.REFACTORER: ["refactor", "clean up", "simplify", "restructure", "reorganize"],
+            WorkerType.REVIEWER: ["review", "audit", "check", "inspect", "code review"],
+            WorkerType.PLANNER: ["plan", "design", "break down", "decompose", "roadmap"],
         }
 
         for worker_type, keywords in routing_rules.items():

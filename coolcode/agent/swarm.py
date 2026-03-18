@@ -114,17 +114,25 @@ class Swarm:
                     )
 
         # Step 2: Spawn workers across ALL providers
+        # Use tracked tools so we get real-time status updates per tool call
+        from coolcode.tools.tracked import make_tracked_tools
+
         all_providers = self.llm_provider.get_all_models()
         workers: list[WorkerAgent] = []
 
         for i, wt in enumerate(worker_types):
             if self._parallel_racing and len(all_providers) > 1:
                 for j, (provider_key, _model) in enumerate(all_providers):
+                    provider_tag = provider_key.split(":")[0]
+                    worker_id = f"{wt.value}-{provider_tag}-{i * 10 + j}"
+                    tracked_tools = make_tracked_tools(self.status, worker_id)
                     workers.append(
-                        self._create_worker(wt, i * 10 + j, tools, provider_key=provider_key)
+                        self._create_worker(wt, i * 10 + j, tracked_tools, provider_key=provider_key)
                     )
             else:
-                workers.append(self._create_worker(wt, i, tools))
+                worker_id = f"{wt.value}-default-{i}"
+                tracked_tools = make_tracked_tools(self.status, worker_id)
+                workers.append(self._create_worker(wt, i, tracked_tools))
 
         provider_names = [pk.split(":")[0] for pk, _ in all_providers]
         self.status.emit(
