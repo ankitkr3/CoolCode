@@ -17,7 +17,6 @@ from coolcode.config import CoolCodeConfig, SwarmConfig
 from coolcode.llm.provider import LLMProvider
 from coolcode.learner import WorkflowLearner
 from coolcode.memory.collective import CollectiveMemory, MemoryType
-from coolcode.optimizer import TokenOptimizer
 from coolcode.status import StatusTracker
 
 logger = logging.getLogger(__name__)
@@ -42,7 +41,6 @@ class Swarm:
         collective_memory: CollectiveMemory | None = None,
         task_router: TaskRouter | None = None,
         status_tracker: StatusTracker | None = None,
-        token_optimizer: TokenOptimizer | None = None,
         learner: WorkflowLearner | None = None,
     ):
         self.config = config
@@ -50,9 +48,6 @@ class Swarm:
         self.collective_memory = collective_memory
         self.task_router = task_router or TaskRouter()
         self.status = status_tracker or StatusTracker()
-        self.optimizer = token_optimizer or TokenOptimizer(
-            cache_dir=str(Path(config.project_dir) / ".coolcode")
-        )
         self.learner = learner or WorkflowLearner(
             persist_path=str(Path.home() / ".coolcode" / "learnings.json")
         )
@@ -98,30 +93,16 @@ class Swarm:
         """Execute a task through the swarm.
 
         Flow:
-        0. Check cache — if identical task was solved before, return instantly
         1. Route the task to appropriate worker types
         2. Use learner to optimize worker count (skip unnecessary workers)
         3. Spawn workers across ALL providers in parallel
         4. Consensus to pick best result
-        5. Cache result + record learning for next time
+        5. Record learning for next time
         """
         self.status.emit("swarm", "analyzing", "samajh rha hoon kya karna hai...")
 
-        # Step 0: Check cache — instant result if we've seen this before
-        worker_types = self.delegator.decide_worker_types(task)
-        for wt in worker_types:
-            cached = self.optimizer.check_cache(task, wt.value)
-            if cached:
-                self.status.emit("cache", "HIT", f"pehle se answer hai! ({wt.value})")
-                return SwarmResult(
-                    output=cached,
-                    worker_results=[],
-                    worker_types_used=worker_types,
-                    best_worker=None,
-                    consensus_algorithm="cache",
-                )
-
         # Step 1: Route
+        worker_types = self.delegator.decide_worker_types(task)
         self.status.emit(
             "queen",
             "routing",
@@ -237,12 +218,7 @@ class Swarm:
             quality_score=quality,
         )
 
-        # Step 5.5: Cache successful result for next time
-        if best_result and best_result.success:
-            self.optimizer.cache_result(task, best_result.worker_type.value, final_output)
-            self.status.emit("cache", "saved", "result cached for next time")
-
-        # Step 5.6: Record learning — what worked, what didn't
+        # Step 5.5: Record learning — what worked, what didn't
         for r in results:
             self.learner.record_execution(
                 task=task,
@@ -252,7 +228,6 @@ class Swarm:
                 duration_ms=r.elapsed_ms,
             )
         self.learner.save()
-        self.optimizer.save()
 
         # Step 6: Store in collective memory
         if self.collective_memory and best_result:

@@ -425,10 +425,7 @@ def _interactive_loop(config: CoolCodeConfig, strategy: str) -> None:
             for key, s in stats.items():
                 console.print(f"  {key}: {s}")
 
-            from coolcode.optimizer import TokenOptimizer
             from coolcode.learner import WorkflowLearner
-            opt = TokenOptimizer(cache_dir=str(Path.home() / ".coolcode"))
-            console.print(f"\n[bold]Cache:[/bold] {opt.cache.stats}")
 
             learner = WorkflowLearner(
                 persist_path=str(Path.home() / ".coolcode" / "learnings.json")
