@@ -18,17 +18,15 @@ import time
 
 import click
 from rich.console import Console
-from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
 from coolcode.agent.swarm import Swarm, SwarmResult
-from coolcode.config import CoolCodeConfig
+from coolcode.config import AVAILABLE_MODELS, CoolCodeConfig, LLMConfig
 from coolcode.llm.provider import LLMProvider
 from coolcode.memory.collective import CollectiveMemory
-from coolcode.memory.scoped import ScopedMemory
 from coolcode.prompts.system import build_system_prompt
 from coolcode.tools import ALL_TOOLS
 
@@ -56,6 +54,203 @@ def _print_banner() -> None:
     console.print(banner)
 
 
+# ---------------------------------------------------------------------------
+# Onboarding — first-time setup
+# ---------------------------------------------------------------------------
+
+def _onboarding(config: CoolCodeConfig) -> CoolCodeConfig:
+    """Interactive setup when no providers are configured.
+
+    Asks user to:
+    1. Choose provider(s)
+    2. Select model(s)
+    3. Enter API key(s)
+
+    Persists to ~/.coolcode/config.json so it never asks again.
+    """
+    console.print()
+    console.print(Panel(
+        "[bold]Welcome to Cool Code![/bold]\n\n"
+        "Let's set up your LLM provider(s). This only happens once —\n"
+        "your config is saved to [cyan]~/.coolcode/config.json[/cyan]\n"
+        "and persists across sessions. Use [cyan]/model[/cyan] anytime to change.",
+        border_style="cyan",
+    ))
+    console.print()
+
+    # Step 1: Choose provider(s)
+    console.print("[bold]Step 1:[/bold] Which provider(s) do you want to use?\n")
+    console.print("  [cyan]1[/cyan]  Claude (Anthropic)        — Best code quality")
+    console.print("  [cyan]2[/cyan]  MiniMax M2.5              — Cheapest, very fast")
+    console.print("  [cyan]3[/cyan]  Both (parallel racing)    — Best of both worlds")
+    console.print()
+
+    choice = ""
+    while choice not in ("1", "2", "3"):
+        try:
+            choice = console.input("[bold]Choose (1/2/3): [/bold]").strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[dim]Setup cancelled.[/dim]")
+            sys.exit(0)
+
+    selected_providers: list[str] = []
+    if choice == "1":
+        selected_providers = ["claude"]
+    elif choice == "2":
+        selected_providers = ["minimax"]
+    elif choice == "3":
+        selected_providers = ["claude", "minimax"]
+
+    providers: list[LLMConfig] = []
+
+    for provider_name in selected_providers:
+        console.print()
+        models = AVAILABLE_MODELS[provider_name]
+
+        # Step 2: Choose model
+        console.print(f"[bold]Step 2:[/bold] Select a [cyan]{provider_name}[/cyan] model:\n")
+        for i, m in enumerate(models, 1):
+            console.print(f"  [cyan]{i}[/cyan]  {m['name']:30s} ({m['tier']})")
+        console.print()
+
+        model_choice = ""
+        valid = [str(i) for i in range(1, len(models) + 1)]
+        while model_choice not in valid:
+            try:
+                model_choice = console.input(f"[bold]Choose (1-{len(models)}) [default: 1]: [/bold]").strip()
+                if not model_choice:
+                    model_choice = "1"
+            except (EOFError, KeyboardInterrupt):
+                console.print("\n[dim]Setup cancelled.[/dim]")
+                sys.exit(0)
+
+        selected_model = models[int(model_choice) - 1]
+
+        # Step 3: API key
+        console.print()
+        if provider_name == "claude":
+            console.print("[dim]Get your key at: https://console.anthropic.com/settings/keys[/dim]")
+        else:
+            console.print("[dim]Get your key at: https://api.minimax.chat[/dim]")
+
+        api_key = ""
+        while not api_key:
+            try:
+                api_key = console.input(f"[bold]Enter {provider_name} API key: [/bold]").strip()
+            except (EOFError, KeyboardInterrupt):
+                console.print("\n[dim]Setup cancelled.[/dim]")
+                sys.exit(0)
+
+        group_id = ""
+        if provider_name == "minimax":
+            try:
+                group_id = console.input("[bold]Enter MiniMax Group ID: [/bold]").strip()
+            except (EOFError, KeyboardInterrupt):
+                console.print("\n[dim]Setup cancelled.[/dim]")
+                sys.exit(0)
+
+        providers.append(LLMConfig(
+            provider=provider_name,
+            model=selected_model["id"],
+            api_key=api_key,
+            group_id=group_id,
+        ))
+
+    config.providers = providers
+    config.save()
+
+    console.print()
+    console.print("[green]Setup complete! Config saved to ~/.coolcode/config.json[/green]")
+    _show_model_status(config)
+    console.print()
+    return config
+
+
+# ---------------------------------------------------------------------------
+# Model management
+# ---------------------------------------------------------------------------
+
+def _show_model_status(config: CoolCodeConfig) -> None:
+    """Display which providers/models are currently active."""
+    table = Table(title="Active Models", show_header=True, border_style="cyan")
+    table.add_column("Provider", style="bold")
+    table.add_column("Model")
+    table.add_column("Status")
+    for p in config.providers:
+        status = "[green]active[/green]" if p.api_key else "[red]no API key[/red]"
+        table.add_row(p.provider, p.model, status)
+    if not config.providers:
+        table.add_row("—", "—", "[red]No providers configured[/red]")
+    console.print(table)
+
+
+def _handle_model_command(args: str, config: CoolCodeConfig) -> None:
+    """/model command — switch models on the fly. Changes are persisted.
+
+    Usage:
+        /model                      — show active models
+        /model setup                — re-run onboarding
+        /model claude               — use only Claude
+        /model minimax              — use only MiniMax
+        /model both                 — use both (parallel racing)
+        /model claude:claude-opus-4-6  — switch Claude to Opus
+    """
+    args = args.strip()
+
+    if not args:
+        _show_model_status(config)
+        console.print()
+        console.print("[dim]Usage: /model <claude|minimax|both|setup> or /model <provider>:<model-name>[/dim]")
+        return
+
+    if args == "setup":
+        _onboarding(config)
+        return
+
+    if args == "both":
+        # Ensure both providers exist in config
+        has_claude = any(p.provider == "claude" for p in config.providers)
+        has_minimax = any(p.provider == "minimax" for p in config.providers)
+
+        if not has_claude or not has_minimax:
+            console.print("[yellow]Missing a provider. Let's set up the missing one.[/yellow]")
+            _onboarding(config)
+            return
+
+        console.print("[green]Switched to both providers (parallel racing)[/green]")
+        _show_model_status(config)
+        config.save()
+        return
+
+    if ":" in args:
+        provider_name, model_name = args.split(":", 1)
+        for p in config.providers:
+            if p.provider == provider_name:
+                old_model = p.model
+                p.model = model_name
+                config.save()
+                console.print(f"[green]{provider_name}: {old_model} -> {model_name} (saved)[/green]")
+                return
+        console.print(f"[red]Provider '{provider_name}' not configured. Run /model setup[/red]")
+        return
+
+    # Single provider: keep only that one active but don't delete the other from saved config
+    target = args.lower()
+    matching = [p for p in config.providers if p.provider == target]
+    if not matching:
+        console.print(f"[red]Provider '{target}' not configured. Run /model setup[/red]")
+        return
+    # Store the full list for /model both later, but use only the selected one
+    config.providers = matching
+    config.save()
+    console.print(f"[green]Switched to {target} only (saved)[/green]")
+    _show_model_status(config)
+
+
+# ---------------------------------------------------------------------------
+# Task execution
+# ---------------------------------------------------------------------------
+
 def _print_stats(result: SwarmResult) -> None:
     stats = result.stats
     table = Table(title="Swarm Stats", show_header=False, border_style="dim")
@@ -70,7 +265,6 @@ def _print_stats(result: SwarmResult) -> None:
     table.add_row("Confidence", f"{stats['best_confidence']:.0%}")
     table.add_row("Consensus", stats["consensus"])
     table.add_row("Avg latency", f"{stats['avg_latency_ms']:.0f}ms")
-    # Show per-provider breakdown
     for provider, counts in stats.get("provider_breakdown", {}).items():
         table.add_row(f"  {provider}", f"{counts['success']}/{counts['total']} succeeded")
     console.print(table)
@@ -78,9 +272,12 @@ def _print_stats(result: SwarmResult) -> None:
 
 async def _run_task(task: str, config: CoolCodeConfig, strategy: str) -> None:
     """Execute a single task through the swarm."""
+    if not config.providers:
+        console.print("[red]No providers configured. Run /model setup[/red]")
+        return
+
     llm_provider = LLMProvider(config, strategy=strategy)
 
-    # Show available providers
     providers = llm_provider.available_providers
     console.print(f"[dim]Providers: {', '.join(providers)}[/dim]")
     console.print(f"[dim]Strategy: {strategy} | Workers: {config.swarm.num_workers} | "
@@ -100,95 +297,18 @@ async def _run_task(task: str, config: CoolCodeConfig, strategy: str) -> None:
         result = await swarm.execute(task, tools=ALL_TOOLS)
     elapsed = time.monotonic() - start
 
-    # Display result
     console.print()
     console.print(Panel(Markdown(result.output), title="Result", border_style="green"))
     console.print()
     console.print(f"[dim]Completed in {elapsed:.1f}s[/dim]")
     _print_stats(result)
 
-    # Save routing data
     swarm.task_router.save()
 
 
-def _show_model_status(config: CoolCodeConfig) -> None:
-    """Display which providers/models are currently active."""
-    table = Table(title="Active Models", show_header=True, border_style="cyan")
-    table.add_column("Provider", style="bold")
-    table.add_column("Model")
-    table.add_column("Status")
-    for p in config.providers:
-        status = "[green]active[/green]" if p.api_key else "[red]no API key[/red]"
-        table.add_row(p.provider, p.model, status)
-    if not config.providers:
-        table.add_row("—", "—", "[red]No providers configured[/red]")
-    console.print(table)
-
-
-def _handle_model_command(args: str, config: CoolCodeConfig) -> None:
-    """/model command — switch models on the fly.
-
-    Usage:
-        /model                      — show active models
-        /model claude               — use only Claude
-        /model minimax              — use only MiniMax
-        /model both                 — use both (parallel racing)
-        /model claude:claude-opus-4-6  — switch Claude to Opus
-        /model minimax:MiniMax-M2.5-Lightning  — switch MiniMax to Lightning
-    """
-    args = args.strip()
-
-    if not args:
-        _show_model_status(config)
-        console.print()
-        console.print("[dim]Usage: /model <claude|minimax|both> or /model <provider>:<model-name>[/dim]")
-        return
-
-    if args == "both":
-        # Re-enable both providers from env
-        anthropic_key = os.getenv("ANTHROPIC_API_KEY", "")
-        minimax_key = os.getenv("MINIMAX_API_KEY", "")
-        from coolcode.config import LLMConfig
-        config.providers = []
-        if anthropic_key:
-            config.providers.append(LLMConfig(
-                provider="claude",
-                model=os.getenv("COOLCODE_CLAUDE_MODEL", "claude-sonnet-4-6"),
-                api_key=anthropic_key,
-            ))
-        if minimax_key:
-            config.providers.append(LLMConfig(
-                provider="minimax",
-                model=os.getenv("COOLCODE_MINIMAX_MODEL", "MiniMax-M2.5"),
-                api_key=minimax_key,
-                group_id=os.getenv("MINIMAX_GROUP_ID", ""),
-            ))
-        console.print("[green]Switched to both providers (parallel racing)[/green]")
-        _show_model_status(config)
-        return
-
-    if ":" in args:
-        # Switch a specific provider's model: e.g., "claude:claude-opus-4-6"
-        provider_name, model_name = args.split(":", 1)
-        for p in config.providers:
-            if p.provider == provider_name:
-                old_model = p.model
-                p.model = model_name
-                console.print(f"[green]{provider_name}: {old_model} → {model_name}[/green]")
-                return
-        console.print(f"[red]Provider '{provider_name}' not found. Add its API key first.[/red]")
-        return
-
-    # Single provider name: claude or minimax — keep only that one
-    target = args.lower()
-    matching = [p for p in config.providers if p.provider == target]
-    if not matching:
-        console.print(f"[red]Provider '{target}' not configured. Set its API key.[/red]")
-        return
-    config.providers = matching
-    console.print(f"[green]Switched to {target} only[/green]")
-    _show_model_status(config)
-
+# ---------------------------------------------------------------------------
+# Interactive loop
+# ---------------------------------------------------------------------------
 
 def _interactive_loop(config: CoolCodeConfig, strategy: str) -> None:
     """Run the interactive REPL."""
@@ -201,10 +321,19 @@ def _interactive_loop(config: CoolCodeConfig, strategy: str) -> None:
 
     _print_banner()
 
-    # Auto-detect: use whatever providers have API keys
+    # If no providers configured, run onboarding
+    if not config.providers:
+        config = _onboarding(config)
+
+    # Show active state
     active = [p.provider for p in config.providers if p.api_key]
-    mode = "parallel racing" if len(active) > 1 else active[0] if active else "none"
-    console.print(f"[dim]Active providers: {', '.join(active)} ({mode}) | Strategy: {strategy}[/dim]")
+    if len(active) > 1:
+        mode = "parallel racing"
+    elif active:
+        mode = active[0]
+    else:
+        mode = "none"
+    console.print(f"[dim]Active: {', '.join(active)} ({mode}) | Strategy: {strategy}[/dim]")
     console.print("[dim]Commands: /model, /stats, /help, quit[/dim]")
     console.print()
 
@@ -221,25 +350,29 @@ def _interactive_loop(config: CoolCodeConfig, strategy: str) -> None:
             console.print("[dim]Goodbye![/dim]")
             break
 
-        # /model command
         if user_input.startswith("/model"):
             _handle_model_command(user_input[6:], config)
             continue
 
         if user_input == "/stats":
+            if not config.providers:
+                console.print("[yellow]No providers configured. Run /model setup[/yellow]")
+                continue
             provider = LLMProvider(config, strategy=strategy)
             stats = provider.get_stats()
             for key, s in stats.items():
                 console.print(f"  {key}: {s}")
             continue
+
         if user_input == "/help":
             console.print("[bold]Commands:[/bold]")
-            console.print("  /model              — Show/switch active models")
-            console.print("  /model claude       — Use only Claude")
-            console.print("  /model minimax      — Use only MiniMax")
-            console.print("  /model both         — Use both (parallel racing)")
-            console.print("  /model claude:claude-opus-4-6  — Switch Claude model")
-            console.print("  /stats              — Show provider performance stats")
+            console.print("  /model              — Show active models")
+            console.print("  /model setup        — Re-run provider setup")
+            console.print("  /model claude       — Switch to Claude only")
+            console.print("  /model minimax      — Switch to MiniMax only")
+            console.print("  /model both         — Both providers (parallel racing)")
+            console.print("  /model claude:claude-opus-4-6  — Switch specific model")
+            console.print("  /stats              — Provider performance stats")
             console.print("  /help               — Show this help")
             console.print("  quit                — Exit Cool Code")
             continue
@@ -252,6 +385,10 @@ def _interactive_loop(config: CoolCodeConfig, strategy: str) -> None:
 
         console.print()
 
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 @click.command()
 @click.argument("task", required=False)
@@ -280,7 +417,10 @@ def main(
         os.environ["COOLCODE_DEFAULT_PROVIDER"] = provider
 
     if task:
-        # One-shot mode
+        # One-shot mode — must have providers
+        if not config.providers:
+            console.print("[red]No providers configured. Run `coolcode` first to set up.[/red]")
+            sys.exit(1)
         try:
             asyncio.run(_run_task(task, config, strategy))
         except KeyboardInterrupt:
@@ -289,7 +429,7 @@ def main(
             console.print(f"[red]Error: {e}[/red]")
             sys.exit(1)
     else:
-        # Interactive mode
+        # Interactive mode — onboarding runs if needed
         _interactive_loop(config, strategy)
 
 
