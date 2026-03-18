@@ -272,29 +272,29 @@ def _print_stats(result: SwarmResult) -> None:
     console.print(table)
 
 
-async def _run_task(task: str, config: CoolCodeConfig, strategy: str) -> None:
-    """Execute a single task through the swarm with live progress display."""
-    if not config.providers:
-        console.print("[red]No providers configured. Run /model setup[/red]")
-        return
-
+def _create_swarm(config: CoolCodeConfig, strategy: str) -> Swarm:
+    """Create a Swarm instance that persists across the session."""
     llm_provider = LLMProvider(config, strategy=strategy)
-    status_tracker = StatusTracker()
-
-    providers = llm_provider.available_providers
-    console.print(f"[dim]Providers: {', '.join(providers)}[/dim]")
-    console.print(f"[dim]Strategy: {strategy} | Workers: {config.swarm.num_workers} | "
-                  f"Consensus: {config.swarm.consensus_algorithm}[/dim]")
-    console.print()
-
     collective_memory = CollectiveMemory(config.memory.sqlite_path)
-
-    swarm = Swarm(
+    return Swarm(
         config=config,
         llm_provider=llm_provider,
         collective_memory=collective_memory,
-        status_tracker=status_tracker,
+        status_tracker=StatusTracker(),
     )
+
+
+async def _run_task(task: str, swarm: Swarm) -> None:
+    """Execute a single task through a persistent swarm with live progress display."""
+    # Refresh the status tracker for this task (new queue, same swarm)
+    swarm.status = StatusTracker()
+    status_tracker = swarm.status
+
+    providers = swarm.llm_provider.available_providers
+    console.print(f"[dim]Providers: {', '.join(providers)}[/dim]")
+    console.print(f"[dim]Strategy: {swarm.llm_provider.strategy} | Workers: {swarm.config.swarm.num_workers} | "
+                  f"Consensus: {swarm.config.swarm.consensus_algorithm}[/dim]")
+    console.print()
 
     start = time.monotonic()
 
@@ -372,7 +372,7 @@ async def _run_task(task: str, config: CoolCodeConfig, strategy: str) -> None:
 # ---------------------------------------------------------------------------
 
 def _interactive_loop(config: CoolCodeConfig, strategy: str) -> None:
-    """Run the interactive REPL."""
+    """Run the interactive REPL with persistent swarm (session memory)."""
     from prompt_toolkit import PromptSession
     from prompt_toolkit.history import FileHistory
 
@@ -385,6 +385,11 @@ def _interactive_loop(config: CoolCodeConfig, strategy: str) -> None:
     # If no providers configured, run onboarding
     if not config.providers:
         config = _onboarding(config)
+
+    # Create a persistent swarm for the entire session — conversation history lives here
+    swarm: Swarm | None = None
+    if config.providers:
+        swarm = _create_swarm(config, strategy)
 
     # Show active state
     active = [p.provider for p in config.providers if p.api_key]
@@ -413,6 +418,10 @@ def _interactive_loop(config: CoolCodeConfig, strategy: str) -> None:
 
         if user_input.startswith("/model"):
             _handle_model_command(user_input[6:], config)
+            # Recreate swarm with new provider config (but preserve conversation history)
+            old_history = swarm._conversation_history if swarm else []
+            swarm = _create_swarm(config, strategy)
+            swarm._conversation_history = old_history
             continue
 
         if user_input == "/stats":
@@ -436,6 +445,14 @@ def _interactive_loop(config: CoolCodeConfig, strategy: str) -> None:
             console.print(f"  Total executions: {lstats['total_executions']}")
             if lstats.get('avg_success_rate'):
                 console.print(f"  Avg success rate: {lstats['avg_success_rate']}")
+
+            # Memory stats
+            if swarm:
+                kg_stats = swarm.knowledge_graph.stats
+                console.print(f"\n[bold]Knowledge Graph:[/bold]")
+                console.print(f"  Nodes: {kg_stats['nodes']}, Edges: {kg_stats['edges']}")
+                console.print(f"\n[bold]Session:[/bold]")
+                console.print(f"  Conversation turns: {len(swarm._conversation_history)}")
             continue
 
         if user_input == "/help":
@@ -446,13 +463,20 @@ def _interactive_loop(config: CoolCodeConfig, strategy: str) -> None:
             console.print("  /model minimax      — Switch to MiniMax only")
             console.print("  /model both         — Both providers (parallel racing)")
             console.print("  /model claude:claude-opus-4-6  — Switch specific model")
-            console.print("  /stats              — Provider stats, cache, and learnings")
+            console.print("  /stats              — Provider stats, learnings, and memory")
             console.print("  /help               — Show this help")
             console.print("  quit                — Exit Cool Code")
             continue
 
+        if not config.providers:
+            console.print("[red]No providers configured. Run /model setup[/red]")
+            continue
+
+        if not swarm:
+            swarm = _create_swarm(config, strategy)
+
         try:
-            asyncio.run(_run_task(user_input, config, strategy))
+            asyncio.run(_run_task(user_input, swarm))
         except Exception as e:
             console.print(f"[red]Error: {e}[/red]")
             logger.exception("Task execution failed")
@@ -496,7 +520,8 @@ def main(
             console.print("[red]No providers configured. Run `coolcode` first to set up.[/red]")
             sys.exit(1)
         try:
-            asyncio.run(_run_task(task, config, strategy))
+            swarm = _create_swarm(config, strategy)
+            asyncio.run(_run_task(task, swarm))
         except KeyboardInterrupt:
             console.print("\n[dim]Interrupted.[/dim]")
         except Exception as e:

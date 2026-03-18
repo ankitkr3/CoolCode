@@ -104,6 +104,33 @@ class WorkflowLearner:
         }
         self._persist_path.write_text(json.dumps(data, indent=2))
 
+    # Error patterns that indicate infrastructure/API failures, NOT task-related failures.
+    # These should NOT count against a worker type's success rate.
+    API_ERROR_PATTERNS = (
+        "invalid_request_error",
+        "authentication_error",
+        "rate_limit",
+        "api_key",
+        "credential",
+        "connection error",
+        "timeout",
+        "503",
+        "502",
+        "429",
+        "401",
+        "403",
+        "Your cred",
+        "Could not process",
+        "overloaded",
+    )
+
+    def _is_api_error(self, error: str | None) -> bool:
+        """Check if an error is an API/infra issue (not a task-quality failure)."""
+        if not error:
+            return False
+        error_lower = error.lower()
+        return any(pat.lower() in error_lower for pat in self.API_ERROR_PATTERNS)
+
     def record_execution(
         self,
         task: str,
@@ -112,8 +139,28 @@ class WorkflowLearner:
         confidence: float,
         duration_ms: float,
         files_accessed: list[str] | None = None,
+        error: str | None = None,
     ) -> None:
-        """Record the outcome of a task execution for future learning."""
+        """Record the outcome of a task execution for future learning.
+
+        API/infrastructure errors are excluded from pattern tracking —
+        they don't reflect worker type capability.
+        """
+        # Skip recording if this was an API/infra error — not the worker's fault
+        if not success and self._is_api_error(error):
+            logger.info(f"Skipping learning for {worker_type}: API/infra error, not task failure")
+            # Still append to history for visibility, but mark it
+            self._task_history.append({
+                "task": task[:200],
+                "worker_type": worker_type,
+                "success": False,
+                "confidence": 0.0,
+                "duration_ms": duration_ms,
+                "timestamp": time.time(),
+                "api_error": True,
+            })
+            return
+
         keywords = self._extract_keywords(task)
         pattern_key = f"{worker_type}:{','.join(sorted(keywords[:5]))}"
 
@@ -156,6 +203,7 @@ class WorkflowLearner:
             "confidence": confidence,
             "duration_ms": duration_ms,
             "timestamp": time.time(),
+            "api_error": False,
         })
 
     def suggest_worker_count(self, task: str) -> int:

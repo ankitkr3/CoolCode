@@ -71,7 +71,7 @@ class MemoryConfig:
     """Configuration for the memory system."""
 
     sqlite_path: str = ""
-    vector_dim: int = 1536
+    vector_dim: int = 384  # MiniLM embedding dimension
     vector_max_elements: int = 100_000
     lru_cache_size: int = 1024
     scopes: list[str] = field(default_factory=lambda: ["project", "local", "user"])

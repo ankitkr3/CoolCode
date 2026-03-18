@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,9 @@ from coolcode.config import CoolCodeConfig, SwarmConfig
 from coolcode.llm.provider import LLMProvider
 from coolcode.learner import WorkflowLearner
 from coolcode.memory.collective import CollectiveMemory, MemoryType
+from coolcode.memory.knowledge_graph import KnowledgeGraph
+from coolcode.memory.learning_bridge import LearningBridge
+from coolcode.memory.scoped import ScopedMemory
 from coolcode.status import StatusTracker
 
 logger = logging.getLogger(__name__)
@@ -42,6 +46,8 @@ class Swarm:
         task_router: TaskRouter | None = None,
         status_tracker: StatusTracker | None = None,
         learner: WorkflowLearner | None = None,
+        knowledge_graph: KnowledgeGraph | None = None,
+        scoped_memory: ScopedMemory | None = None,
     ):
         self.config = config
         self.llm_provider = llm_provider
@@ -51,6 +57,21 @@ class Swarm:
         self.learner = learner or WorkflowLearner(
             persist_path=str(Path.home() / ".coolcode" / "learnings.json")
         )
+
+        # Memory systems
+        project_dir = config.project_dir
+        self.knowledge_graph = knowledge_graph or KnowledgeGraph(
+            persist_path=str(Path(project_dir) / ".coolcode" / "knowledge_graph.json")
+        )
+        self.scoped_memory = scoped_memory or ScopedMemory(project_dir)
+        self.learning_bridge = LearningBridge(
+            project_dir=project_dir,
+            collective_memory=self.collective_memory,
+            knowledge_graph=self.knowledge_graph,
+        )
+
+        # Session conversation history — maintains context within a session
+        self._conversation_history: list[dict[str, str]] = []
 
         swarm_cfg = config.swarm
         self.consensus = ConsensusEngine(
@@ -89,6 +110,60 @@ class Swarm:
             status_tracker=self.status,
         )
 
+    def _build_context(self, task: str) -> str:
+        """Build rich context from conversation history, memory, and project info."""
+        parts: list[str] = []
+
+        # Project directory context
+        parts.append(f"[Project Directory: {self.config.project_dir}]")
+        parts.append(f"[User Home: {Path.home()}]")
+
+        # Conversation history — last 10 exchanges for continuity
+        if self._conversation_history:
+            parts.append("\n--- CONVERSATION HISTORY ---")
+            for entry in self._conversation_history[-10:]:
+                role = entry["role"].upper()
+                parts.append(f"{role}: {entry['content'][:500]}")
+            parts.append("--- END HISTORY ---\n")
+
+        # Semantic recall — find similar past tasks via vector search
+        similar = self.learning_bridge.semantic_recall(task, k=3)
+        if similar:
+            parts.append("\n--- SIMILAR PAST TASKS ---")
+            for s in similar:
+                meta = s.get("metadata", {})
+                parts.append(
+                    f"• [{meta.get('worker_type', '?')}] (confidence: {meta.get('confidence', 0):.0%}) "
+                    f"{meta.get('task', '')[:150]}"
+                )
+            parts.append("--- END SIMILAR ---\n")
+
+        # Relevant memories from collective memory
+        if self.collective_memory:
+            related = self.collective_memory.search(
+                memory_type=MemoryType.INSIGHT, limit=5, min_relevance=0.3
+            )
+            if related:
+                parts.append("\n--- RELEVANT PAST INSIGHTS ---")
+                for mem in related[:3]:
+                    parts.append(f"• {mem['content'][:200]}")
+                parts.append("--- END INSIGHTS ---\n")
+
+        # Knowledge graph — top influential entities
+        top_entities = self.knowledge_graph.get_pagerank(top_k=5)
+        if top_entities:
+            parts.append("\n--- KEY ENTITIES (by influence) ---")
+            for entity_id, score in top_entities:
+                parts.append(f"• {entity_id} (score: {score:.3f})")
+            parts.append("--- END ENTITIES ---\n")
+
+        # Scoped memory — user preferences
+        user_prefs = self.scoped_memory.recall("user", "preferences")
+        if user_prefs:
+            parts.append(f"\n[User Preferences: {json.dumps(user_prefs)[:300]}]")
+
+        return "\n".join(parts)
+
     async def execute(self, task: str, tools: list | None = None) -> SwarmResult:
         """Execute a task through the swarm.
 
@@ -100,6 +175,13 @@ class Swarm:
         5. Record learning for next time
         """
         self.status.emit("swarm", "analyzing", "samajh rha hoon kya karna hai...")
+
+        # Add user message to conversation history
+        self._conversation_history.append({"role": "user", "content": task})
+
+        # Build context from memory + history
+        context = self._build_context(task)
+        enriched_task = f"{context}\n\n[CURRENT TASK]\n{task}"
 
         # Step 1: Route
         worker_types = self.delegator.decide_worker_types(task)
@@ -171,9 +253,9 @@ class Swarm:
             f"{len(workers)} workers across {', '.join(provider_names)}",
         )
 
-        # Step 3: Execute ALL workers in parallel
+        # Step 3: Execute ALL workers in parallel (with enriched context)
         self.status.emit("swarm", "racing", "saare agents lage hue hain...")
-        coros = [w.execute(task) for w in workers]
+        coros = [w.execute(enriched_task) for w in workers]
         results: list[WorkerResult] = await asyncio.gather(*coros)
 
         successful = [r for r in results if r.success]
@@ -226,6 +308,7 @@ class Swarm:
                 success=r.success,
                 confidence=r.confidence,
                 duration_ms=r.elapsed_ms,
+                error=r.error,
             )
         self.learner.save()
 
@@ -239,6 +322,36 @@ class Swarm:
                 tags=[w.value for w in worker_types],
                 relevance_score=quality,
             )
+
+        # Add assistant response to conversation history
+        self._conversation_history.append({"role": "assistant", "content": final_output[:1000]})
+
+        # Learning bridge — embed task+result for semantic recall
+        if best_result:
+            self.learning_bridge.learn_from_task(
+                task=task,
+                result=final_output[:500],
+                worker_type=best_result.worker_type.value,
+                confidence=best_result.confidence,
+                success=best_result.success,
+            )
+            self.learning_bridge.save()
+
+        # Update knowledge graph with task relationships
+        task_node = f"task-{hash(task) % 100000}"
+        self.knowledge_graph.add_entity(task_node, "task", description=task[:200])
+        for wt in worker_types:
+            worker_node = f"worker-{wt.value}"
+            self.knowledge_graph.add_entity(worker_node, "worker_type")
+            self.knowledge_graph.add_relationship(
+                task_node, worker_node, "routed_to", weight=quality
+            )
+        if best_result:
+            best_node = f"worker-{best_result.worker_type.value}"
+            self.knowledge_graph.add_relationship(
+                task_node, best_node, "best_solved_by", weight=best_result.confidence
+            )
+        self.knowledge_graph.save()
 
         self.status.emit("swarm", "done", "ho gya bhai!")
 
