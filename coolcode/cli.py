@@ -83,7 +83,7 @@ def _onboarding(config: CoolCodeConfig) -> CoolCodeConfig:
     # Step 1: Choose provider(s)
     console.print("[bold]Step 1:[/bold] Which provider(s) do you want to use?\n")
     console.print("  [cyan]1[/cyan]  Claude (Anthropic)        — Best code quality")
-    console.print("  [cyan]2[/cyan]  MiniMax M2.5              — Cheapest, very fast")
+    console.print("  [cyan]2[/cyan]  MiniMax (M2.5 / M2.7)    — Fast & affordable")
     console.print("  [cyan]3[/cyan]  Both (parallel racing)    — Best of both worlds")
     console.print()
 
