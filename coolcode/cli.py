@@ -28,6 +28,7 @@ from coolcode.config import AVAILABLE_MODELS, CoolCodeConfig, LLMConfig
 from coolcode.llm.provider import LLMProvider
 from coolcode.memory.collective import CollectiveMemory
 from coolcode.prompts.system import build_system_prompt
+from coolcode.status import StatusTracker
 from coolcode.tools import ALL_TOOLS
 
 console = Console()
@@ -271,12 +272,13 @@ def _print_stats(result: SwarmResult) -> None:
 
 
 async def _run_task(task: str, config: CoolCodeConfig, strategy: str) -> None:
-    """Execute a single task through the swarm."""
+    """Execute a single task through the swarm with live progress display."""
     if not config.providers:
         console.print("[red]No providers configured. Run /model setup[/red]")
         return
 
     llm_provider = LLMProvider(config, strategy=strategy)
+    status_tracker = StatusTracker()
 
     providers = llm_provider.available_providers
     console.print(f"[dim]Providers: {', '.join(providers)}[/dim]")
@@ -290,12 +292,70 @@ async def _run_task(task: str, config: CoolCodeConfig, strategy: str) -> None:
         config=config,
         llm_provider=llm_provider,
         collective_memory=collective_memory,
+        status_tracker=status_tracker,
     )
 
     start = time.monotonic()
-    with console.status("[bold cyan]Swarm is working...[/bold cyan]", spinner="dots"):
-        result = await swarm.execute(task, tools=ALL_TOOLS)
+
+    # Run swarm in background, display live progress in foreground
+    swarm_task = asyncio.create_task(swarm.execute(task, tools=ALL_TOOLS))
+
+    from rich.live import Live
+    from rich.text import Text as RichText
+
+    log_lines: list[str] = []
+
+    with Live(console=console, refresh_per_second=8) as live:
+        hindi_timer = time.monotonic()
+        hindi_msg = status_tracker.next_hindi()
+
+        while not swarm_task.done():
+            update = await status_tracker.get(timeout=0.3)
+
+            if update:
+                # Format: source icon + action + detail
+                icons = {
+                    "swarm": "[bold yellow]>[/bold yellow]",
+                    "queen": "[bold magenta]Q[/bold magenta]",
+                    "router": "[bold blue]R[/bold blue]",
+                }
+                icon = icons.get(update.source, "[bold cyan]W[/bold cyan]")
+                elapsed_so_far = time.monotonic() - start
+                line = f"  {icon} [{elapsed_so_far:5.1f}s] [bold]{update.source}[/bold] {update.action}: [dim]{update.detail}[/dim]"
+                log_lines.append(line)
+
+            # Rotate Hindi message every 4 seconds
+            if time.monotonic() - hindi_timer > 4.0:
+                hindi_msg = status_tracker.next_hindi()
+                hindi_timer = time.monotonic()
+
+            # Build display
+            display = RichText()
+            display.append(f"  {hindi_msg}\n\n", style="bold yellow")
+
+            # Show last 12 log lines
+            visible = log_lines[-12:]
+            display_text = f"  {hindi_msg}\n\n" + "\n".join(visible)
+            live.update(
+                Panel(
+                    display_text,
+                    title="[bold cyan]Cool Code working...[/bold cyan]",
+                    border_style="cyan",
+                    subtitle=f"[dim]{time.monotonic() - start:.1f}s elapsed[/dim]",
+                )
+            )
+
+    result = swarm_task.result()
     elapsed = time.monotonic() - start
+
+    # Show final log
+    console.print()
+    if log_lines:
+        console.print(Panel(
+            "\n".join(log_lines),
+            title="[dim]Activity Log[/dim]",
+            border_style="dim",
+        ))
 
     console.print()
     console.print(Panel(Markdown(result.output), title="Result", border_style="green"))

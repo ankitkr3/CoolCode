@@ -105,9 +105,11 @@ class WorkerAgent:
         model: BaseChatModel | str = "anthropic:claude-sonnet-4-6",
         tools: list | None = None,
         extra_instructions: str = "",
+        status_tracker: Any = None,
     ):
         self.worker_id = worker_id
         self.worker_type = worker_type
+        self._status = status_tracker
 
         system_prompt = (
             f"[Worker ID: {worker_id} | Type: {worker_type.value}]\n\n"
@@ -127,16 +129,24 @@ class WorkerAgent:
 
         self._agent = create_deep_agent(**agent_kwargs)
 
+    def _emit(self, action: str, detail: str = "") -> None:
+        if self._status:
+            self._status.emit(self.worker_id, action, detail)
+
     async def execute(self, task: str) -> WorkerResult:
         """Execute a task and return the result."""
+        self._emit("started", f"working on: {task[:80]}...")
         start = time.monotonic()
         try:
+            self._emit("thinking", "analyzing the task")
             result = await asyncio.to_thread(
                 self._agent.invoke,
                 {"messages": [{"role": "user", "content": task}]},
             )
             output = result["messages"][-1].content
             elapsed = (time.monotonic() - start) * 1000
+
+            self._emit("done", f"completed in {elapsed:.0f}ms")
 
             # Extract confidence from output
             confidence = 0.8
@@ -159,6 +169,7 @@ class WorkerAgent:
             )
         except Exception as e:
             elapsed = (time.monotonic() - start) * 1000
+            self._emit("failed", str(e)[:100])
             logger.error(f"Worker {self.worker_id} failed: {e}")
             return WorkerResult(
                 worker_id=self.worker_id,

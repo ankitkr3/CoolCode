@@ -15,6 +15,7 @@ from coolcode.agent.worker import WorkerAgent, WorkerResult, WorkerType
 from coolcode.config import CoolCodeConfig, SwarmConfig
 from coolcode.llm.provider import LLMProvider
 from coolcode.memory.collective import CollectiveMemory, MemoryType
+from coolcode.status import StatusTracker
 
 logger = logging.getLogger(__name__)
 
@@ -37,11 +38,13 @@ class Swarm:
         llm_provider: LLMProvider,
         collective_memory: CollectiveMemory | None = None,
         task_router: TaskRouter | None = None,
+        status_tracker: StatusTracker | None = None,
     ):
         self.config = config
         self.llm_provider = llm_provider
         self.collective_memory = collective_memory
         self.task_router = task_router or TaskRouter()
+        self.status = status_tracker or StatusTracker()
 
         swarm_cfg = config.swarm
         self.consensus = ConsensusEngine(
@@ -70,7 +73,6 @@ class Swarm:
             model = self.llm_provider.get_model(provider_key)
         else:
             model = self.llm_provider.get_model()
-        # Include provider name in worker_id so we can see which provider won
         provider_tag = provider_key.split(":")[0] if provider_key else "default"
         worker_id = f"{worker_type.value}-{provider_tag}-{index}"
         return WorkerAgent(
@@ -78,6 +80,7 @@ class Swarm:
             worker_type=worker_type,
             model=model,
             tools=tools,
+            status_tracker=self.status,
         )
 
     async def execute(self, task: str, tools: list | None = None) -> SwarmResult:
@@ -88,10 +91,15 @@ class Swarm:
         3. Collect results and reach consensus
         4. Return the best/merged result
         """
-        logger.info(f"Swarm executing: {task[:100]}...")
+        self.status.emit("swarm", "analyzing", "samajh rha hoon kya karna hai...")
 
         # Step 1: Determine worker types
         worker_types = self.delegator.decide_worker_types(task)
+        self.status.emit(
+            "queen",
+            "routing",
+            f"decided workers: {', '.join(w.value for w in worker_types)}",
+        )
 
         # Refine with learned patterns
         learned = self.task_router.suggest_workers(task)
@@ -99,31 +107,34 @@ class Swarm:
             for wt, conf in learned:
                 if conf > 0.7 and wt not in worker_types:
                     worker_types.insert(0, wt)
-
-        logger.info(f"Routing to workers: {[w.value for w in worker_types]}")
+                    self.status.emit(
+                        "router",
+                        "learned",
+                        f"adding {wt.value} (past success: {conf:.0%})",
+                    )
 
         # Step 2: Spawn workers across ALL providers
-        # Each worker type gets one worker per provider — Claude and MiniMax race each other
         all_providers = self.llm_provider.get_all_models()
         workers: list[WorkerAgent] = []
 
         for i, wt in enumerate(worker_types):
             if self._parallel_racing and len(all_providers) > 1:
-                # Race the same worker type across every provider (e.g., coder-claude vs coder-minimax)
                 for j, (provider_key, _model) in enumerate(all_providers):
                     workers.append(
                         self._create_worker(wt, i * 10 + j, tools, provider_key=provider_key)
                     )
             else:
-                # Single provider — fall back to top-ranked
                 workers.append(self._create_worker(wt, i, tools))
 
         provider_names = [pk.split(":")[0] for pk, _ in all_providers]
-        logger.info(
-            f"Spawning {len(workers)} workers across providers: {provider_names}"
+        self.status.emit(
+            "swarm",
+            "spawning",
+            f"{len(workers)} workers across {', '.join(provider_names)}",
         )
 
-        # Step 3: Execute ALL workers in parallel (Claude + MiniMax racing simultaneously)
+        # Step 3: Execute ALL workers in parallel
+        self.status.emit("swarm", "racing", "saare agents lage hue hain...")
         coros = [w.execute(task) for w in workers]
         results: list[WorkerResult] = await asyncio.gather(*coros)
 
@@ -131,9 +142,13 @@ class Swarm:
         failed = [r for r in results if not r.success]
 
         if failed:
-            logger.warning(f"{len(failed)} workers failed: {[r.worker_id for r in failed]}")
+            self.status.emit(
+                "swarm", "warning", f"{len(failed)} workers failed"
+            )
 
         # Step 4: Consensus + merge
+        self.status.emit("queen", "evaluating", "sabse accha result chun rhi hoon...")
+
         if len(successful) <= 1:
             final_output = successful[0].output if successful else "All workers failed."
             best_result = successful[0] if successful else None
@@ -141,14 +156,18 @@ class Swarm:
             consensus_result = await self.evaluator.evaluate_results(successful)
 
             if consensus_result.winner:
-                # Find the winning result
                 best_result = next(
                     (r for r in successful if r.worker_id == consensus_result.winner),
                     successful[0],
                 )
                 final_output = best_result.output
+                self.status.emit(
+                    "queen",
+                    "consensus",
+                    f"winner: {best_result.worker_id} ({consensus_result.agreement_ratio:.0%} agreement)",
+                )
             else:
-                # No consensus — merge results
+                self.status.emit("queen", "merging", "koi clear winner nahi, merge kar rhi hoon...")
                 final_output = await self.coordinator.merge_results(task, successful)
                 best_result = max(successful, key=lambda r: r.confidence)
 
@@ -171,6 +190,8 @@ class Swarm:
                 tags=[w.value for w in worker_types],
                 relevance_score=quality,
             )
+
+        self.status.emit("swarm", "done", "ho gya bhai!")
 
         return SwarmResult(
             output=final_output,
@@ -202,7 +223,6 @@ class SwarmResult:
     def stats(self) -> dict[str, Any]:
         successful = [r for r in self.worker_results if r.success]
 
-        # Count wins per provider from worker IDs like "coder-claude-0", "coder-minimax-1"
         provider_results: dict[str, dict[str, int]] = {}
         for r in self.worker_results:
             parts = r.worker_id.split("-")
