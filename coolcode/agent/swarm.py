@@ -141,9 +141,9 @@ class Swarm:
             f"{len(workers)} workers across {', '.join(provider_names)}",
         )
 
-        # Step 3: Execute ALL workers in parallel
+        # Step 3: Execute ALL workers in parallel with timeout
         self.status.emit("swarm", "racing", "saare agents lage hue hain...")
-        coros = [w.execute(task) for w in workers]
+        coros = [w.execute(task, timeout=120) for w in workers]
         results: list[WorkerResult] = await asyncio.gather(*coros)
 
         successful = [r for r in results if r.success]

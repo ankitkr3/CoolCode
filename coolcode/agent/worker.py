@@ -115,18 +115,21 @@ class WorkerAgent:
             f"[Worker ID: {worker_id} | Type: {worker_type.value}]\n\n"
             f"{WORKER_PROMPTS[worker_type]}\n\n"
             f"{extra_instructions}\n\n"
+            "Be fast and focused. Use tools efficiently — don't read files you don't need.\n"
+            "Use write_todos to track multi-step work.\n"
             "After completing your task, rate your confidence in your output from 0.0 to 1.0 "
             "on the last line as: CONFIDENCE: <number>"
         )
 
-        agent_kwargs: dict[str, Any] = {"system_prompt": system_prompt}
-        if isinstance(model, str):
-            agent_kwargs["model"] = model
-        else:
-            agent_kwargs["model"] = model
+        agent_kwargs: dict[str, Any] = {
+            "system_prompt": system_prompt,
+            "model": model,
+        }
         if tools:
             agent_kwargs["tools"] = tools
 
+        # Use Deep Agents' built-in middleware for planning, filesystem, and summarization
+        # This gives us write_todos, read_file/write_file/edit_file, and context management for free
         self._agent = create_deep_agent(**agent_kwargs)
 
     def _emit(self, action: str, detail: str = "") -> None:
