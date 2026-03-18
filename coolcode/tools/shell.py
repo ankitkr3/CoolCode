@@ -15,14 +15,14 @@ BLOCKED_COMMANDS = {
 def execute_shell(
     command: str,
     working_dir: str = ".",
-    timeout: int = 120,
+    timeout: int = 30,
 ) -> str:
     """Execute a shell command and return its output.
 
     Args:
         command: The shell command to execute.
         working_dir: Working directory for the command.
-        timeout: Timeout in seconds (default 120).
+        timeout: Timeout in seconds (default 30).
 
     Returns:
         Command output (stdout + stderr) or error message.
@@ -32,6 +32,13 @@ def execute_shell(
     for blocked in BLOCKED_COMMANDS:
         if blocked in cmd_lower:
             return f"Error: Blocked dangerous command: {command}"
+
+    # Redirect slow commands to better tools
+    if cmd_lower.startswith("find "):
+        return (
+            "Error: 'find' is slow. Use glob_search(pattern, directory) instead. "
+            "Example: glob_search('**/*.py', '/path/to/project')"
+        )
 
     cwd = Path(working_dir).resolve()
     if not cwd.exists():

@@ -34,7 +34,8 @@ WORKER_PROMPTS: dict[WorkerType, str] = {
     WorkerType.CODER: (
         "You are an expert software engineer. Write clean, efficient, production-ready code. "
         "Follow existing patterns in the codebase. Keep changes minimal and focused. "
-        "Think step-by-step: understand the requirement, examine existing code, plan your change, implement it."
+        "Think step-by-step: understand the requirement, examine existing code, plan your change, implement it.\n"
+        "Be fast: read only the files you need to modify. Use grep to find relevant code, don't read everything."
     ),
     WorkerType.REVIEWER: (
         "You are a senior code reviewer. Analyze code for correctness, performance, security, "
@@ -47,9 +48,16 @@ WORKER_PROMPTS: dict[WorkerType, str] = {
         "Each subtask should be independently completable and testable."
     ),
     WorkerType.RESEARCHER: (
-        "You are a codebase researcher. Thoroughly search and analyze code to understand structure, "
-        "patterns, and dependencies. Provide comprehensive context. Use file search, grep, and "
-        "directory listing to build a complete picture before answering."
+        "You are a codebase researcher. Your job is to quickly understand code architecture.\n\n"
+        "RULES FOR SPEED:\n"
+        "1. Start with list_dir to see the top-level structure. NEVER use 'find' shell commands.\n"
+        "2. Read README.md or equivalent first if it exists.\n"
+        "3. Only read KEY files: entry points (main.py, app.py, index.ts), config files, and core modules.\n"
+        "4. Do NOT read every file. Read at most 5-8 files. Skim structure, don't read line by line.\n"
+        "5. Use glob_search to find patterns (e.g., '**/*.py') instead of shell find commands.\n"
+        "6. Use grep_search to understand imports/dependencies instead of reading whole files.\n"
+        "7. Summarize as you go. Don't collect everything then summarize — stream your understanding.\n\n"
+        "Be FAST. A good 80% understanding in 30 seconds beats a perfect understanding in 5 minutes."
     ),
     WorkerType.DEBUGGER: (
         "You are an expert debugger. Systematically diagnose issues using the scientific method: "
@@ -71,6 +79,19 @@ WORKER_PROMPTS: dict[WorkerType, str] = {
         "flaws, authentication issues, data exposure, and misconfigurations. "
         "Provide specific, actionable remediation steps with code examples."
     ),
+}
+
+
+# Per-worker-type timeout in seconds
+WORKER_TIMEOUTS: dict[WorkerType, int] = {
+    WorkerType.CODER: 180,
+    WorkerType.REVIEWER: 120,
+    WorkerType.PLANNER: 90,
+    WorkerType.RESEARCHER: 180,
+    WorkerType.DEBUGGER: 180,
+    WorkerType.TESTER: 180,
+    WorkerType.REFACTORER: 180,
+    WorkerType.SECURITY: 120,
 }
 
 
@@ -136,8 +157,10 @@ class WorkerAgent:
         if self._status:
             self._status.emit(self.worker_id, action, detail)
 
-    async def execute(self, task: str, timeout: int = 120) -> WorkerResult:
-        """Execute a task and return the result. Times out after `timeout` seconds."""
+    async def execute(self, task: str, timeout: int = 0) -> WorkerResult:
+        """Execute a task and return the result. Uses per-worker-type timeout if not specified."""
+        if timeout <= 0:
+            timeout = WORKER_TIMEOUTS.get(self.worker_type, 180)
         self._emit("started", f"working on: {task[:80]}...")
         start = time.monotonic()
         try:
