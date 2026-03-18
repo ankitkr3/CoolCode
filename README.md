@@ -33,27 +33,67 @@ Cool Code is a swarm-powered CLI coding agent where multiple AI agents race, vot
 pip install git+https://github.com/ankitkr3/CoolCode.git
 ```
 
-### Set API Keys
-
-```bash
-# Required: at least one provider
-export ANTHROPIC_API_KEY=sk-ant-...
-
-# Optional: add MiniMax for parallel racing
-export MINIMAX_API_KEY=...
-export MINIMAX_GROUP_ID=...
-```
-
 ### Run
 
 ```bash
-# Interactive mode
 coolcode
+```
 
-# One-shot task
+On first launch, Cool Code walks you through setup interactively:
+
+```
+╭─────────────────────────────────────────────╮
+│  Welcome to Cool Code!                      │
+│                                             │
+│  Let's set up your LLM provider(s).         │
+│  This only happens once — your config is    │
+│  saved to ~/.coolcode/config.json           │
+│  and persists across sessions.              │
+╰─────────────────────────────────────────────╯
+
+Step 1: Which provider(s) do you want to use?
+
+  1  Claude (Anthropic)        — Best code quality
+  2  MiniMax M2.5              — Cheapest, very fast
+  3  Both (parallel racing)    — Best of both worlds
+
+Choose (1/2/3): 3
+
+Step 2: Select a claude model:
+
+  1  Claude Sonnet 4.6          (Balanced)
+  2  Claude Opus 4.6            (Highest quality)
+  3  Claude Haiku 4.5           (Fastest)
+
+Choose (1-3) [default: 1]: 1
+
+Enter claude API key: sk-ant-...
+
+Step 2: Select a minimax model:
+
+  1  MiniMax M2.5               (Best value)
+  2  MiniMax M2.5 Lightning     (Fastest)
+
+Choose (1-2) [default: 1]: 1
+
+Enter minimax API key: ...
+
+✓ Setup complete! Config saved to ~/.coolcode/config.json
+```
+
+Your config persists across sessions. Use `/model` anytime to switch providers or models.
+
+You can also set API keys via environment variables (these override saved config):
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+export MINIMAX_API_KEY=...
+```
+
+### One-shot mode
+
+```bash
 coolcode "fix the login bug in auth.py"
-
-# With options
 coolcode -s quality "refactor the payment module"
 coolcode -w 5 -c byzantine "implement user dashboard"
 ```
@@ -168,6 +208,7 @@ coolcode/
 | Command | Description |
 |---|---|
 | `/model` | Show active providers and models |
+| `/model setup` | Re-run provider setup (change keys, models) |
 | `/model claude` | Switch to Claude only |
 | `/model minimax` | Switch to MiniMax only |
 | `/model both` | Enable parallel racing (both providers) |
@@ -175,6 +216,8 @@ coolcode/
 | `/stats` | Show provider performance stats |
 | `/help` | Show all commands |
 | `quit` | Exit Cool Code |
+
+All `/model` changes are **persisted** to `~/.coolcode/config.json` — they survive restarts.
 
 ## CLI Options
 
