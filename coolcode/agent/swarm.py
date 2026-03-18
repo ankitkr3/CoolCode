@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 from typing import Any
 
 from langchain_core.language_models import BaseChatModel
@@ -14,7 +15,9 @@ from coolcode.agent.router import TaskRouter
 from coolcode.agent.worker import WorkerAgent, WorkerResult, WorkerType
 from coolcode.config import CoolCodeConfig, SwarmConfig
 from coolcode.llm.provider import LLMProvider
+from coolcode.learner import WorkflowLearner
 from coolcode.memory.collective import CollectiveMemory, MemoryType
+from coolcode.optimizer import TokenOptimizer
 from coolcode.status import StatusTracker
 
 logger = logging.getLogger(__name__)
@@ -39,12 +42,20 @@ class Swarm:
         collective_memory: CollectiveMemory | None = None,
         task_router: TaskRouter | None = None,
         status_tracker: StatusTracker | None = None,
+        token_optimizer: TokenOptimizer | None = None,
+        learner: WorkflowLearner | None = None,
     ):
         self.config = config
         self.llm_provider = llm_provider
         self.collective_memory = collective_memory
         self.task_router = task_router or TaskRouter()
         self.status = status_tracker or StatusTracker()
+        self.optimizer = token_optimizer or TokenOptimizer(
+            cache_dir=str(Path(config.project_dir) / ".coolcode")
+        )
+        self.learner = learner or WorkflowLearner(
+            persist_path=str(Path.home() / ".coolcode" / "learnings.json")
+        )
 
         swarm_cfg = config.swarm
         self.consensus = ConsensusEngine(
@@ -86,15 +97,31 @@ class Swarm:
     async def execute(self, task: str, tools: list | None = None) -> SwarmResult:
         """Execute a task through the swarm.
 
+        Flow:
+        0. Check cache — if identical task was solved before, return instantly
         1. Route the task to appropriate worker types
-        2. Spawn workers across ALL providers in parallel (Claude + MiniMax race)
-        3. Collect results and reach consensus
-        4. Return the best/merged result
+        2. Use learner to optimize worker count (skip unnecessary workers)
+        3. Spawn workers across ALL providers in parallel
+        4. Consensus to pick best result
+        5. Cache result + record learning for next time
         """
         self.status.emit("swarm", "analyzing", "samajh rha hoon kya karna hai...")
 
-        # Step 1: Determine worker types
+        # Step 0: Check cache — instant result if we've seen this before
         worker_types = self.delegator.decide_worker_types(task)
+        for wt in worker_types:
+            cached = self.optimizer.check_cache(task, wt.value)
+            if cached:
+                self.status.emit("cache", "HIT", f"pehle se answer hai! ({wt.value})")
+                return SwarmResult(
+                    output=cached,
+                    worker_results=[],
+                    worker_types_used=worker_types,
+                    best_worker=None,
+                    consensus_algorithm="cache",
+                )
+
+        # Step 1: Route
         self.status.emit(
             "queen",
             "routing",
@@ -113,8 +140,30 @@ class Swarm:
                         f"adding {wt.value} (past success: {conf:.0%})",
                     )
 
-        # Step 2: Spawn workers across ALL providers
-        # Use tracked tools so we get real-time status updates per tool call
+        # Step 1.5: Learner — skip workers that always fail, optimize count
+        skip_types = self.learner.suggest_skip_workers(task)
+        if skip_types:
+            before = len(worker_types)
+            worker_types = [wt for wt in worker_types if wt.value not in skip_types]
+            if len(worker_types) < before:
+                self.status.emit(
+                    "learner",
+                    "optimized",
+                    f"skipped {before - len(worker_types)} low-performing worker types",
+                )
+        if not worker_types:
+            worker_types = [WorkerType.CODER]  # fallback
+
+        # Learner suggests worker count based on past complexity
+        suggested_count = self.learner.suggest_worker_count(task)
+        if suggested_count < self._num_workers:
+            self.status.emit(
+                "learner",
+                "optimized",
+                f"using {suggested_count} workers instead of {self._num_workers} (past patterns show high confidence)",
+            )
+
+        # Step 2: Spawn workers
         from coolcode.tools.tracked import make_tracked_tools
 
         all_providers = self.llm_provider.get_all_models()
@@ -141,9 +190,9 @@ class Swarm:
             f"{len(workers)} workers across {', '.join(provider_names)}",
         )
 
-        # Step 3: Execute ALL workers in parallel with timeout
+        # Step 3: Execute ALL workers in parallel
         self.status.emit("swarm", "racing", "saare agents lage hue hain...")
-        coros = [w.execute(task, timeout=120) for w in workers]
+        coros = [w.execute(task) for w in workers]
         results: list[WorkerResult] = await asyncio.gather(*coros)
 
         successful = [r for r in results if r.success]
@@ -187,6 +236,23 @@ class Swarm:
             success=bool(successful),
             quality_score=quality,
         )
+
+        # Step 5.5: Cache successful result for next time
+        if best_result and best_result.success:
+            self.optimizer.cache_result(task, best_result.worker_type.value, final_output)
+            self.status.emit("cache", "saved", "result cached for next time")
+
+        # Step 5.6: Record learning — what worked, what didn't
+        for r in results:
+            self.learner.record_execution(
+                task=task,
+                worker_type=r.worker_type.value,
+                success=r.success,
+                confidence=r.confidence,
+                duration_ms=r.elapsed_ms,
+            )
+        self.learner.save()
+        self.optimizer.save()
 
         # Step 6: Store in collective memory
         if self.collective_memory and best_result:

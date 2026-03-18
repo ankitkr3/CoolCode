@@ -15,6 +15,7 @@ import logging
 import os
 import sys
 import time
+from pathlib import Path
 
 import click
 from rich.console import Console
@@ -420,8 +421,24 @@ def _interactive_loop(config: CoolCodeConfig, strategy: str) -> None:
                 continue
             provider = LLMProvider(config, strategy=strategy)
             stats = provider.get_stats()
+            console.print("[bold]Provider Stats:[/bold]")
             for key, s in stats.items():
                 console.print(f"  {key}: {s}")
+
+            from coolcode.optimizer import TokenOptimizer
+            from coolcode.learner import WorkflowLearner
+            opt = TokenOptimizer(cache_dir=str(Path.home() / ".coolcode"))
+            console.print(f"\n[bold]Cache:[/bold] {opt.cache.stats}")
+
+            learner = WorkflowLearner(
+                persist_path=str(Path.home() / ".coolcode" / "learnings.json")
+            )
+            lstats = learner.stats
+            console.print(f"\n[bold]Learnings:[/bold]")
+            console.print(f"  Patterns learned: {lstats['patterns_learned']}")
+            console.print(f"  Total executions: {lstats['total_executions']}")
+            if lstats.get('avg_success_rate'):
+                console.print(f"  Avg success rate: {lstats['avg_success_rate']}")
             continue
 
         if user_input == "/help":
@@ -432,7 +449,7 @@ def _interactive_loop(config: CoolCodeConfig, strategy: str) -> None:
             console.print("  /model minimax      — Switch to MiniMax only")
             console.print("  /model both         — Both providers (parallel racing)")
             console.print("  /model claude:claude-opus-4-6  — Switch specific model")
-            console.print("  /stats              — Provider performance stats")
+            console.print("  /stats              — Provider stats, cache, and learnings")
             console.print("  /help               — Show this help")
             console.print("  quit                — Exit Cool Code")
             continue
