@@ -73,6 +73,10 @@ class Swarm:
         # Session conversation history — maintains context within a session
         self._conversation_history: list[dict[str, str]] = []
 
+        # In-process controls — set by CLI during execution
+        self._cancelled = False  # ESC pressed → stop gracefully
+        self._injected_context: list[str] = []  # user-typed info mid-execution
+
         swarm_cfg = config.swarm
         self.consensus = ConsensusEngine(
             algorithm=swarm_cfg.consensus_algorithm,
@@ -114,6 +118,21 @@ class Swarm:
     def set_goal(self, name: str) -> None:
         """Set the active goal. 'general' uses default queen routing."""
         self._goal = name
+
+    def cancel(self) -> None:
+        """Cancel the current execution gracefully."""
+        self._cancelled = True
+        self.status.emit("swarm", "cancelling", "ruko, band kar rha hoon...")
+
+    def inject_context(self, text: str) -> None:
+        """Inject additional context from the user mid-execution."""
+        self._injected_context.append(text)
+        self.status.emit("user", "info added", text[:80])
+
+    def _reset_execution_state(self) -> None:
+        """Reset per-execution state before a new run."""
+        self._cancelled = False
+        self._injected_context.clear()
 
     @property
     def goal(self) -> str:
@@ -157,6 +176,11 @@ class Swarm:
         all_worker_types: list[WorkerType] = []
 
         for stage_idx, stage in enumerate(pipeline.stages):
+            # Check cancellation between stages
+            if self._cancelled:
+                self.status.emit("goal", "cancelled", "user ne rok diya — partial results returned")
+                break
+
             stage_labels = ", ".join(s.label for s in stage.steps)
             self.status.emit(
                 "goal",
@@ -164,10 +188,16 @@ class Swarm:
                 stage_labels,
             )
 
-            # Build context: enriched_task + all previous stage outputs
+            # Build context: enriched_task + all previous stage outputs + injected context
             stage_context = enriched_task
             for i, output in enumerate(all_stage_outputs):
                 stage_context += f"\n\n--- STAGE {i + 1} RESULTS ---\n{output[:4000]}\n--- END STAGE {i + 1} ---"
+
+            # Append any user-injected context (added mid-execution via input)
+            if self._injected_context:
+                stage_context += "\n\n--- ADDITIONAL USER CONTEXT ---\n"
+                stage_context += "\n".join(self._injected_context)
+                stage_context += "\n--- END ADDITIONAL CONTEXT ---"
 
             # Create workers for all steps in this stage (they run in parallel)
             workers: list[WorkerAgent] = []
@@ -331,6 +361,7 @@ class Swarm:
         4. Consensus to pick best result
         5. Record learning for next time
         """
+        self._reset_execution_state()
         self.status.emit("swarm", "analyzing", "samajh rha hoon kya karna hai...")
 
         # Add user message to conversation history
@@ -416,6 +447,16 @@ class Swarm:
             "spawning",
             f"{len(workers)} workers across {', '.join(provider_names)}",
         )
+
+        # Check cancellation before spawning
+        if self._cancelled:
+            self.status.emit("swarm", "cancelled", "user ne rok diya")
+            return SwarmResult(
+                output="Cancelled by user.",
+                worker_results=[],
+                worker_types_used=worker_types,
+                consensus_algorithm=self.consensus.algorithm,
+            )
 
         # Step 3: Execute ALL workers in parallel (with enriched context)
         self.status.emit("swarm", "racing", "saare agents lage hue hain...")

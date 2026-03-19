@@ -284,8 +284,44 @@ def _create_swarm(config: CoolCodeConfig, strategy: str) -> Swarm:
     )
 
 
+def _setup_keyboard_listener():
+    """Set up non-blocking keyboard reading for ESC detection and input injection.
+
+    Returns (read_key, restore) functions.
+    read_key() returns a key character or None (non-blocking).
+    restore() resets terminal to normal mode.
+    """
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+
+    def enable_raw():
+        tty.setcbreak(fd)
+
+    def read_key() -> str | None:
+        """Non-blocking key read. Returns char or None."""
+        import select
+        if select.select([sys.stdin], [], [], 0)[0]:
+            ch = sys.stdin.read(1)
+            return ch
+        return None
+
+    def restore():
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+    enable_raw()
+    return read_key, restore
+
+
 async def _run_task(task: str, swarm: Swarm) -> None:
-    """Execute a single task through a persistent swarm with live progress display."""
+    """Execute a single task through a persistent swarm with live progress display.
+
+    Supports:
+    - ESC to cancel execution gracefully
+    - Type text + Enter to inject additional context mid-execution
+    """
     # Refresh the status tracker for this task (new queue, same swarm)
     swarm.status = StatusTracker()
     status_tracker = swarm.status
@@ -295,6 +331,7 @@ async def _run_task(task: str, swarm: Swarm) -> None:
     console.print(f"[dim]Providers: {', '.join(providers)}[/dim]")
     console.print(f"[dim]Strategy: {swarm.llm_provider.strategy} | Workers: {swarm.config.swarm.num_workers} | "
                   f"Consensus: {swarm.config.swarm.consensus_algorithm}{goal_text}[/dim]")
+    console.print(f"[dim]Press ESC to cancel | Type text + Enter to add context[/dim]")
     console.print()
 
     start = time.monotonic()
@@ -306,47 +343,113 @@ async def _run_task(task: str, swarm: Swarm) -> None:
     from rich.text import Text as RichText
 
     log_lines: list[str] = []
+    cancelled = False
+    input_buffer: list[str] = []  # collects typed characters
 
-    with Live(console=console, refresh_per_second=8) as live:
-        hindi_timer = time.monotonic()
-        hindi_msg = status_tracker.next_hindi()
+    # Set up non-blocking keyboard
+    read_key = None
+    restore_term = None
+    try:
+        read_key, restore_term = _setup_keyboard_listener()
+    except Exception:
+        pass  # If terminal setup fails (e.g., piped input), skip keyboard features
 
-        while not swarm_task.done():
-            update = await status_tracker.get(timeout=0.3)
+    try:
+        with Live(console=console, refresh_per_second=8) as live:
+            hindi_timer = time.monotonic()
+            hindi_msg = status_tracker.next_hindi()
 
-            if update:
-                # Format: source icon + action + detail
-                icons = {
-                    "swarm": "[bold yellow]>[/bold yellow]",
-                    "queen": "[bold magenta]Q[/bold magenta]",
-                    "router": "[bold blue]R[/bold blue]",
-                    "goal": "[bold green]G[/bold green]",
-                }
-                icon = icons.get(update.source, "[bold cyan]W[/bold cyan]")
-                elapsed_so_far = time.monotonic() - start
-                line = f"  {icon} [{elapsed_so_far:5.1f}s] [bold]{update.source}[/bold] {update.action}: [dim]{update.detail}[/dim]"
-                log_lines.append(line)
+            while not swarm_task.done():
+                update = await status_tracker.get(timeout=0.15)
 
-            # Rotate Hindi message every 4 seconds
-            if time.monotonic() - hindi_timer > 4.0:
-                hindi_msg = status_tracker.next_hindi()
-                hindi_timer = time.monotonic()
+                # Check keyboard input
+                if read_key:
+                    key = read_key()
+                    if key:
+                        if key == '\x1b':  # ESC key
+                            cancelled = True
+                            swarm.cancel()
+                            log_lines.append(
+                                "  [bold red]✕[/bold red] [bold]user[/bold] cancelled: ESC pressed — stopping gracefully..."
+                            )
+                        elif key == '\r' or key == '\n':  # Enter
+                            if input_buffer:
+                                user_text = "".join(input_buffer).strip()
+                                if user_text:
+                                    swarm.inject_context(user_text)
+                                    log_lines.append(
+                                        f"  [bold yellow]+[/bold yellow] [bold]user[/bold] added context: [dim]{user_text[:80]}[/dim]"
+                                    )
+                                input_buffer.clear()
+                        elif key == '\x7f':  # Backspace
+                            if input_buffer:
+                                input_buffer.pop()
+                        elif key.isprintable():
+                            input_buffer.append(key)
 
-            # Build display
-            display = RichText()
-            display.append(f"  {hindi_msg}\n\n", style="bold yellow")
+                if update:
+                    # Format: source icon + action + detail
+                    icons = {
+                        "swarm": "[bold yellow]>[/bold yellow]",
+                        "queen": "[bold magenta]Q[/bold magenta]",
+                        "router": "[bold blue]R[/bold blue]",
+                        "goal": "[bold green]G[/bold green]",
+                        "user": "[bold yellow]+[/bold yellow]",
+                    }
+                    icon = icons.get(update.source, "[bold cyan]W[/bold cyan]")
+                    elapsed_so_far = time.monotonic() - start
+                    line = f"  {icon} [{elapsed_so_far:5.1f}s] [bold]{update.source}[/bold] {update.action}: [dim]{update.detail}[/dim]"
+                    log_lines.append(line)
 
-            # Show last 12 log lines
-            visible = log_lines[-12:]
-            display_text = f"  {hindi_msg}\n\n" + "\n".join(visible)
-            live.update(
-                Panel(
-                    display_text,
-                    title="[bold cyan]Cool Code working...[/bold cyan]",
-                    border_style="cyan",
-                    subtitle=f"[dim]{time.monotonic() - start:.1f}s elapsed[/dim]",
+                # Rotate Hindi message every 4 seconds
+                if time.monotonic() - hindi_timer > 4.0:
+                    hindi_msg = status_tracker.next_hindi()
+                    hindi_timer = time.monotonic()
+
+                # Build display
+                display = RichText()
+                display.append(f"  {hindi_msg}\n\n", style="bold yellow")
+
+                # Show last 12 log lines
+                visible = log_lines[-12:]
+
+                # Show input buffer if user is typing
+                input_line = ""
+                if input_buffer:
+                    input_line = f"\n\n  [bold]> {''.join(input_buffer)}[/bold]"
+
+                display_text = f"  {hindi_msg}\n\n" + "\n".join(visible) + input_line
+                subtitle_text = f"[dim]{time.monotonic() - start:.1f}s elapsed | ESC=cancel | type=add info[/dim]"
+                live.update(
+                    Panel(
+                        display_text,
+                        title="[bold cyan]Cool Code working...[/bold cyan]",
+                        border_style="red" if cancelled else "cyan",
+                        subtitle=subtitle_text,
+                    )
                 )
-            )
+    finally:
+        # Restore terminal to normal mode
+        if restore_term:
+            restore_term()
+
+    # Handle result
+    if cancelled and not swarm_task.done():
+        swarm_task.cancel()
+        try:
+            await swarm_task
+        except asyncio.CancelledError:
+            pass
+        console.print()
+        console.print("[yellow]Execution cancelled by user (ESC)[/yellow]")
+        # Show partial log
+        if log_lines:
+            console.print(Panel(
+                "\n".join(log_lines),
+                title="[dim]Partial Activity Log[/dim]",
+                border_style="yellow",
+            ))
+        return
 
     result = swarm_task.result()
     elapsed = time.monotonic() - start
