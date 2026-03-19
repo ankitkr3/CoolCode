@@ -621,6 +621,83 @@ def _interactive_loop(config: CoolCodeConfig, strategy: str) -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _ensure_path() -> None:
+    """Ensure the coolcode script directory is in PATH. Auto-fix if possible."""
+    import shutil
+    import subprocess
+
+    # If `coolcode` is already findable via PATH, nothing to do
+    if shutil.which("coolcode"):
+        return
+
+    # Find where pip installed the script
+    user_bin = Path(sys.executable).parent  # e.g. /usr/local/bin or ~/.local/bin
+    # Also check the user-scheme bin
+    try:
+        import site
+        user_base = Path(site.getusersitepackages()).parent  # e.g. ~/Library/Python/3.11
+        user_script_dir = user_base / "bin"
+    except Exception:
+        user_script_dir = None
+
+    script_path = None
+    for candidate in [user_bin / "coolcode", user_script_dir and user_script_dir / "coolcode"]:
+        if candidate and candidate.exists():
+            script_path = candidate
+            break
+
+    if not script_path:
+        return  # Can't find the script, nothing to fix
+
+    script_dir = str(script_path.parent)
+
+    # Check if script_dir is already in PATH
+    if script_dir in os.environ.get("PATH", "").split(":"):
+        return
+
+    # Try to create a symlink in /usr/local/bin (always in PATH on macOS/Linux)
+    symlink_target = Path("/usr/local/bin/coolcode")
+    if symlink_target.parent.exists() and not symlink_target.exists():
+        try:
+            symlink_target.symlink_to(script_path)
+            console.print(f"[green]✓[/green] [dim]Linked coolcode → /usr/local/bin/coolcode[/dim]")
+            return
+        except PermissionError:
+            # Try with sudo
+            try:
+                subprocess.run(
+                    ["sudo", "ln", "-sf", str(script_path), str(symlink_target)],
+                    check=True,
+                    capture_output=True,
+                    timeout=30,
+                )
+                console.print(f"[green]✓[/green] [dim]Linked coolcode → /usr/local/bin/coolcode[/dim]")
+                return
+            except Exception:
+                pass
+
+    # Fallback: add to shell profile
+    shell = os.environ.get("SHELL", "")
+    rc_file = Path.home() / (".zshrc" if "zsh" in shell else ".bashrc")
+    export_line = f'export PATH="{script_dir}:$PATH"'
+
+    # Check if already in rc file
+    if rc_file.exists() and export_line in rc_file.read_text():
+        console.print(f"[yellow]PATH is set in {rc_file.name} but not loaded. Run:[/yellow]")
+        console.print(f"  [bold]source ~/{rc_file.name}[/bold]")
+        return
+
+    # Add to rc file
+    try:
+        with open(rc_file, "a") as f:
+            f.write(f"\n# Cool Code CLI\n{export_line}\n")
+        console.print(f"[green]✓[/green] [dim]Added coolcode to PATH in ~/{rc_file.name}[/dim]")
+        console.print(f"  [dim]Run [bold]source ~/{rc_file.name}[/bold] or open a new terminal[/dim]")
+    except Exception:
+        console.print(f"[yellow]Add this to your ~/{rc_file.name}:[/yellow]")
+        console.print(f"  [bold]{export_line}[/bold]")
+
+
 @click.command()
 @click.argument("task", required=False)
 @click.option("--provider", "-p", type=click.Choice(["claude", "minimax"]), help="Preferred LLM provider")
@@ -638,6 +715,9 @@ def main(
 ) -> None:
     """Cool Code — the smarter CLI coding agent with swarm intelligence."""
     _setup_logging(verbose)
+
+    # Auto-fix PATH on first run so `coolcode` works in future sessions
+    _ensure_path()
 
     config = CoolCodeConfig.from_env(project_dir=os.getcwd())
     config.swarm.num_workers = workers
