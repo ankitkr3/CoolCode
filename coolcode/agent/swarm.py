@@ -87,6 +87,7 @@ class Swarm:
 
         self._num_workers = swarm_cfg.num_workers
         self._parallel_racing = swarm_cfg.parallel_racing
+        self._goal = "general"  # default — queen routes everything
 
     def _create_worker(
         self,
@@ -108,6 +109,162 @@ class Swarm:
             model=model,
             tools=tools,
             status_tracker=self.status,
+        )
+
+    def set_goal(self, name: str) -> None:
+        """Set the active goal. 'general' uses default queen routing."""
+        self._goal = name
+
+    @property
+    def goal(self) -> str:
+        return self._goal
+
+    def _create_goal_worker(
+        self,
+        worker_type: WorkerType,
+        index: int,
+        prompt_override: str,
+        tools: list | None = None,
+        timeout: int = 180,
+    ) -> WorkerAgent:
+        """Create a worker with a goal-specific system prompt override."""
+        model = self.llm_provider.get_model()
+        worker_id = f"{worker_type.value}-goal-{index}"
+        return WorkerAgent(
+            worker_id=worker_id,
+            worker_type=worker_type,
+            model=model,
+            tools=tools,
+            status_tracker=self.status,
+            system_prompt_override=prompt_override,
+        )
+
+    async def _execute_goal_pipeline(
+        self, task: str, enriched_task: str, tools: list | None = None
+    ) -> SwarmResult:
+        """Execute a goal pipeline — predetermined worker sequence, no queen routing."""
+        from coolcode.agent.goals import get_goal
+        from coolcode.tools.tracked import make_tracked_tools
+
+        pipeline = get_goal(self._goal)
+        if not pipeline:
+            raise ValueError(f"Unknown goal: {self._goal}")
+
+        self.status.emit("goal", "started", f"goal: {pipeline.name} — {pipeline.description}")
+
+        all_stage_outputs: list[str] = []
+        all_results: list[WorkerResult] = []
+        all_worker_types: list[WorkerType] = []
+
+        for stage_idx, stage in enumerate(pipeline.stages):
+            stage_labels = ", ".join(s.label for s in stage.steps)
+            self.status.emit(
+                "goal",
+                f"stage {stage_idx + 1}/{len(pipeline.stages)}",
+                stage_labels,
+            )
+
+            # Build context: enriched_task + all previous stage outputs
+            stage_context = enriched_task
+            for i, output in enumerate(all_stage_outputs):
+                stage_context += f"\n\n--- STAGE {i + 1} RESULTS ---\n{output[:4000]}\n--- END STAGE {i + 1} ---"
+
+            # Create workers for all steps in this stage (they run in parallel)
+            workers: list[WorkerAgent] = []
+            for step_idx, step in enumerate(stage.steps):
+                worker_idx = stage_idx * 10 + step_idx
+                worker_id = f"{step.worker_type.value}-goal-{worker_idx}"
+                tracked_tools = make_tracked_tools(self.status, worker_id)
+                w = self._create_goal_worker(
+                    worker_type=step.worker_type,
+                    index=worker_idx,
+                    prompt_override=step.prompt_override,
+                    tools=tracked_tools,
+                    timeout=step.timeout,
+                )
+                workers.append(w)
+                all_worker_types.append(step.worker_type)
+
+            # Execute all steps in this stage in parallel
+            coros = [w.execute(stage_context, timeout=step.timeout) for w, step in zip(workers, stage.steps)]
+            stage_results: list[WorkerResult] = await asyncio.gather(*coros)
+            all_results.extend(stage_results)
+
+            # Merge stage results
+            successful = [r for r in stage_results if r.success]
+            if not successful:
+                self.status.emit("goal", "warning", f"stage {stage_idx + 1} failed — all workers errored")
+                all_stage_outputs.append(f"[Stage {stage_idx + 1} failed: no successful workers]")
+                continue
+
+            if stage.merge_strategy == "concatenate":
+                merged = "\n\n---\n\n".join(r.output for r in successful)
+            else:
+                # Default: use best result
+                merged = max(successful, key=lambda r: r.confidence).output
+
+            all_stage_outputs.append(merged)
+
+            for r in successful:
+                self.status.emit(
+                    r.worker_id, "done",
+                    f"confidence: {r.confidence:.0%}, {r.elapsed_ms:.0f}ms"
+                )
+
+        # Combine all stage outputs into final result
+        final_output = "\n\n".join(all_stage_outputs)
+
+        # Best result across all stages
+        successful_all = [r for r in all_results if r.success]
+        best_result = max(successful_all, key=lambda r: r.confidence) if successful_all else None
+
+        # Learn from execution
+        quality = best_result.confidence if best_result else 0.0
+        for r in all_results:
+            self.learner.record_execution(
+                task=task,
+                worker_type=r.worker_type.value,
+                success=r.success,
+                confidence=r.confidence,
+                duration_ms=r.elapsed_ms,
+                error=r.error,
+            )
+        self.learner.save()
+
+        # Store in memory
+        if self.collective_memory and best_result:
+            self.collective_memory.store(
+                memory_id=f"goal-{self._goal}-{hash(task) % 100000}",
+                memory_type=MemoryType.INSIGHT,
+                content=f"Goal: {self._goal}\nTask: {task[:200]}\n"
+                f"Stages: {len(pipeline.stages)}, Workers: {len(all_results)}\n"
+                f"Best: {best_result.worker_id} ({best_result.confidence:.2f})",
+                tags=[self._goal] + [w.value for w in all_worker_types],
+                relevance_score=quality,
+            )
+
+        # Conversation history
+        self._conversation_history.append({"role": "assistant", "content": final_output[:1000]})
+
+        # Learning bridge
+        if best_result:
+            self.learning_bridge.learn_from_task(
+                task=task,
+                result=final_output[:500],
+                worker_type=best_result.worker_type.value,
+                confidence=best_result.confidence,
+                success=best_result.success,
+            )
+            self.learning_bridge.save()
+
+        self.status.emit("goal", "done", f"{pipeline.name} complete — ho gya bhai!")
+
+        return SwarmResult(
+            output=final_output,
+            worker_results=all_results,
+            worker_types_used=list(set(all_worker_types)),
+            best_worker=best_result,
+            consensus_algorithm=f"goal:{pipeline.name}",
         )
 
     def _build_context(self, task: str) -> str:
@@ -183,7 +340,14 @@ class Swarm:
         context = self._build_context(task)
         enriched_task = f"{context}\n\n[CURRENT TASK]\n{task}"
 
-        # Step 1: Route
+        # Goal pipeline — if a goal is active, bypass queen routing entirely
+        if self._goal != "general":
+            from coolcode.agent.goals import get_goal
+            pipeline = get_goal(self._goal)
+            if pipeline:
+                return await self._execute_goal_pipeline(task, enriched_task, tools)
+
+        # Step 1: Route (general mode — queen decides)
         worker_types = self.delegator.decide_worker_types(task)
         self.status.emit(
             "queen",

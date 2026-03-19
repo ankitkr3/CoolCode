@@ -291,9 +291,10 @@ async def _run_task(task: str, swarm: Swarm) -> None:
     status_tracker = swarm.status
 
     providers = swarm.llm_provider.available_providers
+    goal_text = f" | Goal: {swarm.goal}" if swarm.goal != "general" else ""
     console.print(f"[dim]Providers: {', '.join(providers)}[/dim]")
     console.print(f"[dim]Strategy: {swarm.llm_provider.strategy} | Workers: {swarm.config.swarm.num_workers} | "
-                  f"Consensus: {swarm.config.swarm.consensus_algorithm}[/dim]")
+                  f"Consensus: {swarm.config.swarm.consensus_algorithm}{goal_text}[/dim]")
     console.print()
 
     start = time.monotonic()
@@ -319,6 +320,7 @@ async def _run_task(task: str, swarm: Swarm) -> None:
                     "swarm": "[bold yellow]>[/bold yellow]",
                     "queen": "[bold magenta]Q[/bold magenta]",
                     "router": "[bold blue]R[/bold blue]",
+                    "goal": "[bold green]G[/bold green]",
                 }
                 icon = icons.get(update.source, "[bold cyan]W[/bold cyan]")
                 elapsed_so_far = time.monotonic() - start
@@ -400,7 +402,7 @@ def _interactive_loop(config: CoolCodeConfig, strategy: str) -> None:
     else:
         mode = "none"
     console.print(f"[dim]Active: {', '.join(active)} ({mode}) | Strategy: {strategy}[/dim]")
-    console.print("[dim]Commands: /model, /stats, /help, quit[/dim]")
+    console.print("[dim]Commands: /model, /goal, /stats, /help, quit[/dim]")
     console.print()
 
     while True:
@@ -422,6 +424,37 @@ def _interactive_loop(config: CoolCodeConfig, strategy: str) -> None:
             old_history = swarm._conversation_history if swarm else []
             swarm = _create_swarm(config, strategy)
             swarm._conversation_history = old_history
+            continue
+
+        if user_input.startswith("/goal"):
+            from coolcode.agent.goals import list_goals, get_goal
+            args = user_input[5:].strip()
+            if not args:
+                # Show current goal + available goals
+                current = swarm.goal if swarm else "general"
+                console.print(f"[bold]Current goal:[/bold] [cyan]{current}[/cyan]\n")
+                console.print("[bold]Available goals:[/bold]")
+                for g in list_goals():
+                    marker = " [green]← active[/green]" if g["name"] == current else ""
+                    console.print(f"  [cyan]{g['name']:20s}[/cyan] {g['description']}{marker}")
+                console.print()
+                console.print("[dim]Usage: /goal <name>[/dim]")
+            else:
+                # Switch goal
+                valid_names = [g["name"] for g in list_goals()]
+                if args not in valid_names:
+                    console.print(f"[red]Unknown goal: {args}[/red]")
+                    console.print(f"[dim]Available: {', '.join(valid_names)}[/dim]")
+                else:
+                    if swarm:
+                        swarm.set_goal(args)
+                    if args == "general":
+                        console.print("[green]Switched to general mode — queen routes everything[/green]")
+                    else:
+                        pipeline = get_goal(args)
+                        console.print(f"[green]Switched to goal: {args}[/green]")
+                        console.print(f"[dim]{pipeline.description}[/dim]")
+                        console.print(f"[dim]Pipeline: {len(pipeline.stages)} stages[/dim]")
             continue
 
         if user_input == "/stats":
@@ -463,6 +496,14 @@ def _interactive_loop(config: CoolCodeConfig, strategy: str) -> None:
             console.print("  /model minimax      — Switch to MiniMax only")
             console.print("  /model both         — Both providers (parallel racing)")
             console.print("  /model claude:claude-opus-4-6  — Switch specific model")
+            console.print("  /goal               — Show current goal + available goals")
+            console.print("  /goal code-review   — Deep code review mode")
+            console.print("  /goal cyber-security — Security audit (OWASP/CWE/SANS)")
+            console.print("  /goal build-feature — Plan → implement → test → review")
+            console.print("  /goal debug         — Diagnose → fix → verify")
+            console.print("  /goal explain       — Architecture explanation")
+            console.print("  /goal optimize      — Performance optimization")
+            console.print("  /goal general       — Back to default (queen routes)")
             console.print("  /stats              — Provider stats, learnings, and memory")
             console.print("  /help               — Show this help")
             console.print("  quit                — Exit Cool Code")

@@ -127,14 +127,18 @@ class WorkerAgent:
         tools: list | None = None,
         extra_instructions: str = "",
         status_tracker: Any = None,
+        system_prompt_override: str | None = None,
     ):
         self.worker_id = worker_id
         self.worker_type = worker_type
         self._status = status_tracker
 
+        # Goal-specific prompts replace the default; otherwise use the standard prompt
+        base_prompt = system_prompt_override or WORKER_PROMPTS[worker_type]
+
         system_prompt = (
             f"[Worker ID: {worker_id} | Type: {worker_type.value}]\n\n"
-            f"{WORKER_PROMPTS[worker_type]}\n\n"
+            f"{base_prompt}\n\n"
             f"{extra_instructions}\n\n"
             "Be fast and focused. Use tools efficiently — don't read files you don't need.\n"
             "Use write_todos to track multi-step work.\n"
