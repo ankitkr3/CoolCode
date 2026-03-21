@@ -378,49 +378,49 @@ class Swarm:
         parts.append(f"[Project Directory: {self.config.project_dir}]")
         parts.append(f"[User Home: {Path.home()}]")
 
-        # Conversation history — last 10 exchanges for continuity
+        # YOUR CONVERSATION HISTORY (this session)
         if self._conversation_history:
-            parts.append("\n--- CONVERSATION HISTORY ---")
+            parts.append("\n--- YOUR CONVERSATION HISTORY (this session) ---")
             for entry in self._conversation_history[-10:]:
                 role = entry["role"].upper()
                 parts.append(f"{role}: {entry['content'][:500]}")
-            parts.append("--- END HISTORY ---\n")
+            parts.append("--- END CONVERSATION HISTORY ---\n")
 
-        # Semantic recall — find similar past tasks via vector search
+        # YOUR MEMORY: similar tasks you've handled before
         similar = self.learning_bridge.semantic_recall(task, k=3)
         if similar:
-            parts.append("\n--- SIMILAR PAST TASKS ---")
+            parts.append("\n--- YOUR MEMORY: PAST TASKS YOU'VE HANDLED ---")
             for s in similar:
                 meta = s.get("metadata", {})
                 parts.append(
                     f"• [{meta.get('worker_type', '?')}] (confidence: {meta.get('confidence', 0):.0%}) "
                     f"{meta.get('task', '')[:150]}"
                 )
-            parts.append("--- END SIMILAR ---\n")
+            parts.append("--- END PAST TASKS ---\n")
 
-        # Relevant memories from collective memory
+        # YOUR MEMORY: insights and learnings from past work
         if self.collective_memory:
             related = self.collective_memory.search(
                 memory_type=MemoryType.INSIGHT, limit=5, min_relevance=0.3
             )
             if related:
-                parts.append("\n--- RELEVANT PAST INSIGHTS ---")
+                parts.append("\n--- YOUR MEMORY: INSIGHTS FROM PAST WORK ---")
                 for mem in related[:3]:
                     parts.append(f"• {mem['content'][:200]}")
                 parts.append("--- END INSIGHTS ---\n")
 
-        # Knowledge graph — top influential entities
+        # YOUR MEMORY: key concepts and entities you've learned about
         top_entities = self.knowledge_graph.get_pagerank(top_k=5)
         if top_entities:
-            parts.append("\n--- KEY ENTITIES (by influence) ---")
+            parts.append("\n--- YOUR MEMORY: KEY CONCEPTS YOU KNOW ---")
             for entity_id, score in top_entities:
-                parts.append(f"• {entity_id} (score: {score:.3f})")
-            parts.append("--- END ENTITIES ---\n")
+                parts.append(f"• {entity_id} (relevance: {score:.3f})")
+            parts.append("--- END CONCEPTS ---\n")
 
-        # Scoped memory — user preferences
+        # YOUR MEMORY: user preferences
         user_prefs = self.scoped_memory.recall("user", "preferences")
         if user_prefs:
-            parts.append(f"\n[User Preferences: {json.dumps(user_prefs)[:300]}]")
+            parts.append(f"\n[Your Memory — User Preferences: {json.dumps(user_prefs)[:300]}]")
 
         return "\n".join(parts)
 
