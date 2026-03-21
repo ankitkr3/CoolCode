@@ -181,6 +181,18 @@ class WorkerAgent:
             output = result["messages"][-1].content
             elapsed = (time.monotonic() - start) * 1000
 
+            # Extract token usage from LLM response metadata
+            usage_meta = {}
+            last_msg = result["messages"][-1]
+            if hasattr(last_msg, "usage_metadata") and last_msg.usage_metadata:
+                usage_meta = dict(last_msg.usage_metadata)
+            elif hasattr(last_msg, "response_metadata"):
+                rm = last_msg.response_metadata or {}
+                if "usage" in rm:
+                    usage_meta = rm["usage"]
+                elif "token_usage" in rm:
+                    usage_meta = rm["token_usage"]
+
             self._emit("done", f"completed in {elapsed:.0f}ms")
 
             # Extract confidence from output
@@ -201,6 +213,10 @@ class WorkerAgent:
                 output=output,
                 confidence=confidence,
                 elapsed_ms=elapsed,
+                metadata={
+                    "input_tokens": usage_meta.get("input_tokens", 0),
+                    "output_tokens": usage_meta.get("output_tokens", 0),
+                },
             )
         except (asyncio.TimeoutError, TimeoutError):
             elapsed = (time.monotonic() - start) * 1000

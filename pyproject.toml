@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "coolcode"
-version = "0.1.0"
+version = "0.3.0"
 description = "A smarter CLI coding agent with swarm intelligence, built on LangChain Deep Agents"
 requires-python = ">=3.11"
 license = {text = "MIT"}

@@ -26,6 +26,9 @@ Cool Code is a swarm-powered CLI coding agent where multiple AI agents race, vot
 | Planning | Manual breakdown | Automatic decomposition across 5 domains |
 | Specialized Workflows | One-size-fits-all | 6 goal pipelines (security audit, code review, debug, ...) |
 | Interactive Control | Wait or kill | ESC to cancel, type mid-execution to inject context |
+| Cost Visibility | Silent token burn | Real-time cost display, per-task tracking, budget caps |
+| Autonomous Pipelines | One step at a time | Multi-stage workflows with human gates & git checkpoints |
+| Background Intelligence | Reactive only | Daemon mode watches files, detects issues proactively |
 
 ## Quick Start
 
@@ -206,6 +209,16 @@ coolcode/
 │   ├── shell.py            # Shell execution with safety checks
 │   ├── search.py           # Grep + definition finder
 │   └── git.py              # Git operations
+├── auto/
+│   ├── pipeline.py         # Autonomous multi-stage pipeline orchestration
+│   ├── gates.py            # Human approval gates (approve/reject/edit/rollback)
+│   └── checkpoints.py      # Git checkpoint management for rollback
+├── daemon/
+│   ├── server.py           # Background daemon with Unix socket IPC
+│   ├── watchers.py         # File and git event watchers
+│   ├── insights.py         # Proactive insight engine (heuristic-based)
+│   └── ipc.py              # IPC client for interactive CLI
+├── cost.py                 # Cost tracking, budgets, daily persistence
 ├── planning/
 │   ├── decomposer.py       # Auto task decomposition (5 domains)
 │   └── parallel.py         # Parallel agent racing
@@ -252,6 +265,67 @@ Goal pipelines include:
 - **ESC** — cancel current execution immediately (all workers stop gracefully)
 - **Type + Enter** — inject additional context mid-execution without stopping
 
+### Cost Visibility
+
+Real-time cost tracking across all providers — no more silent token burn.
+
+- **Live cost in activity panel**: see `$0.0023 | 3.2s` as workers execute
+- **Per-task cost**: every task shows input/output tokens and USD cost in stats
+- **Budget caps**: `/budget daily 5.00` or `/budget session 2.00`
+- **Auto-warning**: alerts at 80% budget, blocks at 100%
+- **Provider breakdown**: see which provider costs what in `/stats`
+- **Daily persistence**: costs logged to `~/.coolcode/costs.jsonl`
+
+### Autonomous Pipelines (`/auto`)
+
+Multi-stage autonomous workflows with human approval gates and git rollback.
+
+```
+Cool Code > /auto build user dashboard with auth and tests
+
+┌──────────────────────────────────────┐
+│  Autonomous Pipeline Plan            │
+├────┬─────────────────┬───────┬──────┤
+│  # │ Stage           │ Gate  │ Cost │
+├────┼─────────────────┼───────┼──────┤
+│  1 │ Plan & Arch     │ GATE  │ $0.01│
+│  2 │ Implement Core  │       │ $0.02│
+│  3 │ Write Tests     │       │ $0.01│
+│  4 │ Code Review     │ GATE  │ $0.02│
+│  5 │ Apply Fixes     │       │ $0.01│
+└────┴─────────────────┴───────┴──────┘
+
+Start pipeline? (y/n): y
+```
+
+At each **GATE**, execution pauses and you choose:
+- **Approve** — continue to next stage
+- **Reject** — stop the pipeline
+- **Edit** — give corrective instructions and re-run the stage
+- **Rollback** — reset to before this stage (via git checkpoint)
+
+### Daemon Mode (`/daemon`)
+
+Background process that watches your project and proactively surfaces insights.
+
+```bash
+Cool Code > /daemon start
+Daemon started watching: /Users/you/project
+```
+
+The daemon:
+- **Watches file changes** — detects rapid edits, growing files, missing test updates
+- **Watches git events** — branch switches, new commits
+- **Surfaces insights** between prompts: *"auth.py changed 5 times but tests not updated"*
+- **Learns patterns** — which files are edited together, common workflows
+- **Zero cost** — uses heuristics, no LLM calls
+
+```
+Cool Code >
+  ! [daemon] auth.py changed 5 times but tests not updated
+  > [daemon] cli.py is 750 lines — consider splitting it
+```
+
 ### Multi-Provider LLM
 - **Claude** (Sonnet, Opus, Haiku) — best code quality
 - **MiniMax** (M2.7, M2.7-highspeed, M2.5, M2.5-highspeed) — fast and affordable
@@ -294,7 +368,16 @@ Goal pipelines include:
 | `/goal explain` | Architecture explanation |
 | `/goal optimize` | Performance optimization |
 | `/goal general` | Back to default (queen routes everything) |
-| `/stats` | Show provider stats, learnings, and memory |
+| `/auto <task>` | Autonomous pipeline with gates & checkpoints |
+| `/cost` | Quick cost summary (session + today) |
+| `/budget` | View/set budget caps |
+| `/budget daily 5.00` | Set daily budget to $5 |
+| `/budget session 2` | Set session budget to $2 |
+| `/budget off` | Remove budget limits |
+| `/daemon start` | Start background file/git watcher |
+| `/daemon stop` | Stop the daemon |
+| `/daemon status` | Show daemon info and stats |
+| `/stats` | Provider stats, learnings, cost, and memory |
 | `/help` | Show all commands |
 | `quit` | Exit Cool Code |
 

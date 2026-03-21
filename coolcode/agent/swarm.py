@@ -15,6 +15,7 @@ from coolcode.agent.queen import QueenAgent, QueenType
 from coolcode.agent.router import TaskRouter
 from coolcode.agent.worker import WorkerAgent, WorkerResult, WorkerType
 from coolcode.config import CoolCodeConfig, SwarmConfig
+from coolcode.cost import CostTracker
 from coolcode.llm.provider import LLMProvider
 from coolcode.learner import WorkflowLearner
 from coolcode.memory.collective import CollectiveMemory, MemoryType
@@ -48,12 +49,14 @@ class Swarm:
         learner: WorkflowLearner | None = None,
         knowledge_graph: KnowledgeGraph | None = None,
         scoped_memory: ScopedMemory | None = None,
+        cost_tracker: CostTracker | None = None,
     ):
         self.config = config
         self.llm_provider = llm_provider
         self.collective_memory = collective_memory
         self.task_router = task_router or TaskRouter()
         self.status = status_tracker or StatusTracker()
+        self.cost_tracker = cost_tracker or CostTracker()
         self.learner = learner or WorkflowLearner(
             persist_path=str(Path.home() / ".coolcode" / "learnings.json")
         )
@@ -133,6 +136,38 @@ class Swarm:
         """Reset per-execution state before a new run."""
         self._cancelled = False
         self._injected_context.clear()
+
+    def _record_costs(self, results: list[WorkerResult], task: str = "") -> float:
+        """Record costs from worker results. Returns total cost."""
+        total = 0.0
+        for r in results:
+            input_tokens = r.metadata.get("input_tokens", 0)
+            output_tokens = r.metadata.get("output_tokens", 0)
+            if input_tokens or output_tokens:
+                # Extract provider and model from worker_id (format: type-provider-idx)
+                parts = r.worker_id.split("-")
+                provider = parts[1] if len(parts) >= 3 else "unknown"
+                # Find the model from the provider config
+                model = ""
+                for p in self.config.providers:
+                    if p.provider == provider or provider == "goal" or provider == "default":
+                        model = p.model
+                        break
+                if not model and self.config.providers:
+                    model = self.config.providers[0].model
+                cost = self.cost_tracker.record(
+                    provider=provider,
+                    model=model,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    task_snippet=task[:100],
+                )
+                total += cost
+                self.status.emit(
+                    r.worker_id, "cost",
+                    f"${cost:.4f} ({input_tokens} in / {output_tokens} out)"
+                )
+        return total
 
     async def _gather_with_cancel(
         self, coros: list, poll_interval: float = 0.5
@@ -284,6 +319,7 @@ class Swarm:
             # Execute all steps in this stage — with cancellation support
             coros = [w.execute(stage_context, timeout=step.timeout) for w, step in zip(workers, stage.steps)]
             stage_results = await self._gather_with_cancel(coros)
+            self._record_costs(stage_results, task)
             all_results.extend(stage_results)
 
             # Merge stage results
@@ -536,6 +572,9 @@ class Swarm:
         coros = [w.execute(enriched_task) for w in workers]
         results: list[WorkerResult] = await self._gather_with_cancel(coros)
 
+        # Record costs from worker results
+        task_cost = self._record_costs(results, task)
+
         successful = [r for r in results if r.success]
         failed = [r for r in results if not r.success]
 
@@ -678,6 +717,18 @@ class SwarmResult:
             parts = self.best_worker.worker_id.split("-")
             winning_provider = parts[1] if len(parts) >= 3 else "unknown"
 
+        # Aggregate token usage and cost
+        total_input = sum(r.metadata.get("input_tokens", 0) for r in self.worker_results)
+        total_output = sum(r.metadata.get("output_tokens", 0) for r in self.worker_results)
+        total_cost = sum(
+            CostTracker.calculate_cost(
+                self._resolve_model(r),
+                r.metadata.get("input_tokens", 0),
+                r.metadata.get("output_tokens", 0),
+            )
+            for r in self.worker_results
+        )
+
         return {
             "total_workers": len(self.worker_results),
             "successful": len(successful),
@@ -691,4 +742,12 @@ class SwarmResult:
             "avg_latency_ms": (
                 sum(r.elapsed_ms for r in successful) / len(successful) if successful else 0
             ),
+            "input_tokens": total_input,
+            "output_tokens": total_output,
+            "task_cost_usd": total_cost,
         }
+
+    @staticmethod
+    def _resolve_model(result: WorkerResult) -> str:
+        """Best-effort model name from worker_id."""
+        return result.metadata.get("model", "")

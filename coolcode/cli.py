@@ -34,6 +34,7 @@ from rich.text import Text
 
 from coolcode.agent.swarm import Swarm, SwarmResult
 from coolcode.config import AVAILABLE_MODELS, CoolCodeConfig, LLMConfig
+from coolcode.cost import CostTracker
 from coolcode.llm.provider import LLMProvider
 from coolcode.memory.collective import CollectiveMemory
 from coolcode.prompts.system import build_system_prompt
@@ -294,12 +295,17 @@ def _print_stats(result: SwarmResult) -> None:
     table.add_row("Confidence", f"{stats['best_confidence']:.0%}")
     table.add_row("Consensus", stats["consensus"])
     table.add_row("Avg latency", f"{stats['avg_latency_ms']:.0f}ms")
+    # Cost info
+    if stats.get("task_cost_usd", 0) > 0:
+        table.add_row("Task cost", f"${stats['task_cost_usd']:.4f}")
+    if stats.get("input_tokens", 0) > 0:
+        table.add_row("Tokens", f"{stats['input_tokens']:,} in / {stats['output_tokens']:,} out")
     for provider, counts in stats.get("provider_breakdown", {}).items():
         table.add_row(f"  {provider}", f"{counts['success']}/{counts['total']} succeeded")
     console.print(table)
 
 
-def _create_swarm(config: CoolCodeConfig, strategy: str) -> Swarm:
+def _create_swarm(config: CoolCodeConfig, strategy: str, cost_tracker: CostTracker | None = None) -> Swarm:
     """Create a Swarm instance that persists across the session."""
     llm_provider = LLMProvider(config, strategy=strategy)
     collective_memory = CollectiveMemory(config.memory.sqlite_path)
@@ -308,6 +314,7 @@ def _create_swarm(config: CoolCodeConfig, strategy: str) -> Swarm:
         llm_provider=llm_provider,
         collective_memory=collective_memory,
         status_tracker=StatusTracker(),
+        cost_tracker=cost_tracker or CostTracker(),
     )
 
 
@@ -471,7 +478,7 @@ async def _run_task(task: str, swarm: Swarm) -> None:
                     display_text,
                     title="[bold cyan]⚡ Cool Code[/bold cyan]",
                     border_style=border,
-                    subtitle=f"[dim]{elapsed_now:.1f}s | ESC=cancel | type+Enter=add info[/dim]",
+                    subtitle=f"[dim]${swarm.cost_tracker.session_total:.4f} | {elapsed_now:.1f}s | ESC=cancel | type+Enter=add info[/dim]",
                     padding=(1, 2),
                 )
             )
@@ -523,6 +530,73 @@ async def _run_task(task: str, swarm: Swarm) -> None:
     swarm.task_router.save()
 
 
+async def _run_auto_pipeline(task: str, swarm: Swarm) -> None:
+    """Run an autonomous pipeline with planning, gates, and checkpoints."""
+    from coolcode.auto.pipeline import AutoPipeline
+
+    pipeline = AutoPipeline(swarm=swarm, gate_frequency=2)
+
+    # Plan
+    console.print(f"\n[bold cyan]Planning autonomous pipeline...[/bold cyan]")
+    plan = pipeline.plan(task)
+    pipeline.show_plan(plan)
+
+    # Confirm
+    try:
+        confirm = console.input("[bold]Start pipeline? (y/n): [/bold]").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        console.print("[dim]Cancelled.[/dim]")
+        return
+    if confirm not in ("y", "yes"):
+        console.print("[dim]Pipeline cancelled.[/dim]")
+        return
+
+    console.print()
+
+    # Execute
+    result = await pipeline.execute(plan)
+
+    # Show results
+    console.print()
+    if result.cancelled:
+        console.print(f"[yellow]Pipeline stopped after stage {result.stages_completed}/{result.total_stages}[/yellow]")
+    elif result.rollback_stage >= 0:
+        console.print(f"[blue]Pipeline rolled back to before stage {result.rollback_stage + 1}[/blue]")
+    else:
+        console.print(f"[green]Pipeline complete: {result.stages_completed}/{result.total_stages} stages[/green]")
+
+    # Show stage summary
+    table = Table(title="Pipeline Results", show_header=True, border_style="cyan")
+    table.add_column("#", width=4)
+    table.add_column("Stage")
+    table.add_column("Status")
+    table.add_column("Cost")
+    table.add_column("Time")
+
+    for sr in result.stage_results:
+        status = "[green]OK[/green]" if sr.success else "[red]FAIL[/red]"
+        table.add_row(
+            str(sr.stage_index + 1),
+            sr.description,
+            status,
+            f"${sr.cost_usd:.4f}",
+            f"{sr.elapsed_ms / 1000:.1f}s",
+        )
+
+    console.print(table)
+    console.print(f"\n[bold]Total cost:[/bold] ${result.total_cost:.4f}")
+
+    # Show final output
+    if result.final_output:
+        from rich.markdown import Markdown
+        console.print(Panel(
+            Markdown(result.final_output[:5000]),
+            title="[bold green]Final Output[/bold green]",
+            border_style="green",
+            padding=(1, 2),
+        ))
+
+
 # ---------------------------------------------------------------------------
 # Interactive loop
 # ---------------------------------------------------------------------------
@@ -559,7 +633,24 @@ def _interactive_loop(config: CoolCodeConfig, strategy: str) -> None:
     console.print("[dim]Commands: /model, /goal, /stats, /help, quit[/dim]")
     console.print()
 
+    # Daemon client for checking insights
+    daemon_client = None
+    try:
+        from coolcode.daemon.ipc import DaemonClient
+        daemon_client = DaemonClient()
+    except ImportError:
+        pass
+
     while True:
+        # Show daemon insights if any
+        if daemon_client and daemon_client.is_running():
+            insights = daemon_client.get_insights()
+            for insight in insights:
+                icon = {"warning": "[yellow]![/yellow]", "suggestion": "[cyan]>[/cyan]"}.get(
+                    insight.severity, "[dim]*[/dim]"
+                )
+                console.print(f"  {icon} [dim][daemon][/dim] {insight.message}")
+
         try:
             user_input = session.prompt("Cool Code > ").strip()
         except (EOFError, KeyboardInterrupt):
@@ -574,9 +665,10 @@ def _interactive_loop(config: CoolCodeConfig, strategy: str) -> None:
 
         if user_input.startswith("/model"):
             _handle_model_command(user_input[6:], config)
-            # Recreate swarm with new provider config (but preserve conversation history)
+            # Recreate swarm with new provider config (but preserve conversation history + cost)
             old_history = swarm._conversation_history if swarm else []
-            swarm = _create_swarm(config, strategy)
+            old_cost = swarm.cost_tracker if swarm else None
+            swarm = _create_swarm(config, strategy, cost_tracker=old_cost)
             swarm._conversation_history = old_history
             continue
 
@@ -633,6 +725,24 @@ def _interactive_loop(config: CoolCodeConfig, strategy: str) -> None:
             if lstats.get('avg_success_rate'):
                 console.print(f"  Avg success rate: {lstats['avg_success_rate']}")
 
+            # Cost stats
+            if swarm:
+                ct = swarm.cost_tracker
+                inp, out = ct.session_tokens
+                console.print(f"\n[bold]Cost:[/bold]")
+                console.print(f"  Session: ${ct.session_total:.4f}")
+                console.print(f"  Today: ${ct.daily_total():.4f}")
+                console.print(f"  Tokens: {inp:,} in / {out:,} out")
+                breakdown = ct.provider_breakdown()
+                for key, info in breakdown.items():
+                    console.print(f"    {key}: ${info['cost_usd']:.4f} ({info['calls']} calls)")
+                budget = ct.check_budget(
+                    daily_limit=config.cost.budget_daily_usd,
+                    session_limit=config.cost.budget_session_usd,
+                )
+                if not budget.ok:
+                    console.print(f"  [yellow]{budget}[/yellow]")
+
             # Memory stats
             if swarm:
                 kg_stats = swarm.knowledge_graph.stats
@@ -640,6 +750,82 @@ def _interactive_loop(config: CoolCodeConfig, strategy: str) -> None:
                 console.print(f"  Nodes: {kg_stats['nodes']}, Edges: {kg_stats['edges']}")
                 console.print(f"\n[bold]Session:[/bold]")
                 console.print(f"  Conversation turns: {len(swarm._conversation_history)}")
+            continue
+
+        if user_input.startswith("/budget"):
+            args = user_input[7:].strip()
+            if not args:
+                console.print(f"[bold]Budget:[/bold]")
+                console.print(f"  Daily limit:   ${config.cost.budget_daily_usd:.2f}" if config.cost.budget_daily_usd > 0 else "  Daily limit:   unlimited")
+                console.print(f"  Session limit: ${config.cost.budget_session_usd:.2f}" if config.cost.budget_session_usd > 0 else "  Session limit: unlimited")
+                if swarm:
+                    console.print(f"  Session spent: ${swarm.cost_tracker.session_total:.4f}")
+                    console.print(f"  Today spent:   ${swarm.cost_tracker.daily_total():.4f}")
+                console.print("[dim]Usage: /budget daily 5.00 | /budget session 2.00 | /budget off[/dim]")
+            elif args == "off":
+                config.cost.budget_daily_usd = 0.0
+                config.cost.budget_session_usd = 0.0
+                console.print("[green]Budget limits removed[/green]")
+            elif args.startswith("daily"):
+                try:
+                    config.cost.budget_daily_usd = float(args.split()[1])
+                    console.print(f"[green]Daily budget set to ${config.cost.budget_daily_usd:.2f}[/green]")
+                except (IndexError, ValueError):
+                    console.print("[red]Usage: /budget daily <amount>[/red]")
+            elif args.startswith("session"):
+                try:
+                    config.cost.budget_session_usd = float(args.split()[1])
+                    console.print(f"[green]Session budget set to ${config.cost.budget_session_usd:.2f}[/green]")
+                except (IndexError, ValueError):
+                    console.print("[red]Usage: /budget session <amount>[/red]")
+            continue
+
+        if user_input == "/cost":
+            if swarm:
+                ct = swarm.cost_tracker
+                inp, out = ct.session_tokens
+                console.print(f"[bold]Session:[/bold] ${ct.session_total:.4f} ({inp:,} in / {out:,} out)")
+                console.print(f"[bold]Today:[/bold]   ${ct.daily_total():.4f}")
+            else:
+                console.print("[dim]No cost data yet[/dim]")
+            continue
+
+        if user_input.startswith("/daemon"):
+            from coolcode.daemon.ipc import DaemonClient
+            from coolcode.daemon.server import daemonize, is_daemon_running, stop_daemon, get_daemon_pid
+            args = user_input[7:].strip()
+            if args == "start":
+                if is_daemon_running():
+                    console.print(f"[yellow]Daemon already running (PID: {get_daemon_pid()})[/yellow]")
+                else:
+                    project_dir = config.project_dir
+                    daemonize(project_dir)
+                    console.print(f"[green]Daemon started watching: {project_dir}[/green]")
+            elif args == "stop":
+                if stop_daemon():
+                    console.print("[green]Daemon stopped[/green]")
+                else:
+                    console.print("[yellow]No daemon running[/yellow]")
+            elif args == "status":
+                client = DaemonClient()
+                if client.is_running():
+                    status = client.get_status()
+                    if status:
+                        console.print(f"[green]Daemon running[/green]")
+                        console.print(f"  Project: {status.get('project_dir', '?')}")
+                        console.print(f"  Uptime: {status.get('uptime_s', 0):.0f}s")
+                        stats = status.get("stats", {})
+                        console.print(f"  Events tracked: {stats.get('total_events', 0)}")
+                        console.print(f"  Unique files: {stats.get('unique_files', 0)}")
+                    else:
+                        console.print(f"[green]Daemon running (PID: {get_daemon_pid()})[/green]")
+                else:
+                    console.print("[dim]Daemon not running. Use /daemon start[/dim]")
+            else:
+                console.print("[bold]Daemon Mode[/bold] — background watcher + proactive insights")
+                console.print("  /daemon start    — Start watching this project")
+                console.print("  /daemon stop     — Stop the daemon")
+                console.print("  /daemon status   — Show daemon status")
             continue
 
         if user_input == "/help":
@@ -658,9 +844,41 @@ def _interactive_loop(config: CoolCodeConfig, strategy: str) -> None:
             console.print("  /goal explain       — Architecture explanation")
             console.print("  /goal optimize      — Performance optimization")
             console.print("  /goal general       — Back to default (queen routes)")
-            console.print("  /stats              — Provider stats, learnings, and memory")
+            console.print("  /auto <task>        — Autonomous pipeline with gates & checkpoints")
+            console.print("  /cost               — Quick cost summary")
+            console.print("  /budget             — View/set budget caps")
+            console.print("  /budget daily 5.00  — Set $5/day limit")
+            console.print("  /budget session 2   — Set $2/session limit")
+            console.print("  /budget off         — Remove budget limits")
+            console.print("  /daemon start       — Start background watcher")
+            console.print("  /daemon stop        — Stop background watcher")
+            console.print("  /daemon status      — Show daemon info")
+            console.print("  /stats              — Provider stats, learnings, cost, and memory")
             console.print("  /help               — Show this help")
             console.print("  quit                — Exit Cool Code")
+            continue
+
+        if user_input.startswith("/auto"):
+            args = user_input[5:].strip()
+            if not args:
+                console.print("[bold]Autonomous Pipeline[/bold]")
+                console.print("  Run multi-stage tasks with checkpoints and human approval gates.")
+                console.print()
+                console.print("[dim]Usage: /auto <task description>[/dim]")
+                console.print("[dim]  /auto build user dashboard with auth and tests[/dim]")
+                console.print("[dim]  /auto refactor the payment module end to end[/dim]")
+                continue
+            if not swarm:
+                if not config.providers:
+                    console.print("[red]No providers configured. Run /model setup[/red]")
+                    continue
+                swarm = _create_swarm(config, strategy)
+            try:
+                asyncio.run(_run_auto_pipeline(args, swarm))
+            except Exception as e:
+                console.print(f"[red]Auto pipeline error: {e}[/red]")
+                logger.exception("Auto pipeline failed")
+            console.print()
             continue
 
         if not config.providers:

@@ -80,6 +80,14 @@ class MemoryConfig:
 
 
 @dataclass
+class CostConfig:
+    """Configuration for cost tracking and budget caps."""
+
+    budget_daily_usd: float = 0.0  # 0 = unlimited
+    budget_session_usd: float = 0.0  # 0 = unlimited
+
+
+@dataclass
 class CoolCodeConfig:
     """Root configuration for Cool Code."""
 
@@ -87,6 +95,7 @@ class CoolCodeConfig:
     providers: list[LLMConfig] = field(default_factory=list)
     swarm: SwarmConfig = field(default_factory=SwarmConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
+    cost: CostConfig = field(default_factory=CostConfig)
     max_retries: int = 3
     verbose: bool = False
 
