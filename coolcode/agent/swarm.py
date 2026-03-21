@@ -73,8 +73,9 @@ class Swarm:
             knowledge_graph=self.knowledge_graph,
         )
 
-        # Session conversation history — maintains context within a session
-        self._conversation_history: list[dict[str, str]] = []
+        # Conversation history — persisted across sessions
+        self._history_path = Path(config.project_dir) / ".coolcode" / "conversation_history.json"
+        self._conversation_history: list[dict[str, str]] = self._load_history()
 
         # In-process controls — set by CLI during execution
         self._cancelled = False  # ESC pressed → stop gracefully
@@ -131,6 +132,27 @@ class Swarm:
         """Inject additional context from the user mid-execution."""
         self._injected_context.append(text)
         self.status.emit("user", "info added", text[:80])
+
+    def _load_history(self) -> list[dict[str, str]]:
+        """Load conversation history from disk."""
+        try:
+            if self._history_path.exists():
+                data = json.loads(self._history_path.read_text())
+                # Keep last 100 exchanges to prevent unbounded growth
+                return data[-100:]
+        except (json.JSONDecodeError, IOError, KeyError):
+            pass
+        return []
+
+    def _save_history(self) -> None:
+        """Persist conversation history to disk."""
+        try:
+            self._history_path.parent.mkdir(parents=True, exist_ok=True)
+            # Keep last 100 exchanges
+            data = self._conversation_history[-100:]
+            self._history_path.write_text(json.dumps(data, indent=2))
+        except IOError as e:
+            logger.warning(f"Failed to save conversation history: {e}")
 
     def _reset_execution_state(self) -> None:
         """Reset per-execution state before a new run."""
@@ -375,8 +397,9 @@ class Swarm:
                 relevance_score=quality,
             )
 
-        # Conversation history
+        # Conversation history (persisted)
         self._conversation_history.append({"role": "assistant", "content": final_output[:1000]})
+        self._save_history()
 
         # Learning bridge
         if best_result:
@@ -473,8 +496,9 @@ class Swarm:
         self._reset_execution_state()
         self.status.emit("swarm", "analyzing", "samajh rha hoon kya karna hai...")
 
-        # Add user message to conversation history
+        # Add user message to conversation history (persisted)
         self._conversation_history.append({"role": "user", "content": task})
+        self._save_history()
 
         # Build context from memory + history
         context = self._build_context(task)
