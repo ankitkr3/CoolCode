@@ -53,12 +53,16 @@ class ScopedMemory:
         path.write_text(json.dumps(data, indent=2))
 
     def recall(self, scope: str, key: str) -> Any | None:
-        """Retrieve a memory from the given scope. Returns None if not found."""
+        """Retrieve a memory from the given scope. Returns None if not found or corrupt."""
         path = self._path(scope, key)
         if not path.exists():
             return None
-        data = json.loads(path.read_text())
-        return data.get("value")
+        try:
+            data = json.loads(path.read_text())
+            return data.get("value")
+        except (json.JSONDecodeError, IOError) as e:
+            logger.warning(f"Corrupt memory file {path}: {e}")
+            return None
 
     def recall_all(self, scope: str) -> dict[str, Any]:
         """Retrieve all memories from a scope."""

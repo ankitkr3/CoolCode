@@ -23,7 +23,7 @@ class VectorStore:
 
     def __init__(
         self,
-        dim: int = 1536,
+        dim: int = 384,  # matches EMBEDDING_DIM from embeddings.py (all-MiniLM-L6-v2)
         max_elements: int = 100_000,
         persist_dir: str | None = None,
         ef_construction: int = 200,
