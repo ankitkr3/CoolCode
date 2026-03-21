@@ -134,6 +134,62 @@ class Swarm:
         self._cancelled = False
         self._injected_context.clear()
 
+    async def _gather_with_cancel(
+        self, coros: list, poll_interval: float = 0.5
+    ) -> list[WorkerResult]:
+        """Run coroutines concurrently, cancelling all if ESC is pressed.
+
+        Unlike asyncio.gather, this checks self._cancelled periodically and
+        cancels remaining tasks immediately — preventing the hang where workers
+        keep running after ESC because asyncio.to_thread ignores cancellation.
+        """
+        tasks = [asyncio.ensure_future(c) for c in coros]
+        results: list[WorkerResult | None] = [None] * len(tasks)
+
+        while True:
+            # Check for cancellation
+            if self._cancelled:
+                for t in tasks:
+                    if not t.done():
+                        t.cancel()
+                self.status.emit("goal", "cancelling", "ruko, workers band kar rha hoon...")
+                break
+
+            # Check if all tasks are done
+            all_done = all(t.done() for t in tasks)
+            if all_done:
+                break
+
+            await asyncio.sleep(poll_interval)
+
+        # Collect results — cancelled/errored tasks return a timeout result
+        final: list[WorkerResult] = []
+        for i, t in enumerate(tasks):
+            try:
+                if t.done() and not t.cancelled():
+                    final.append(t.result())
+                else:
+                    # Task was cancelled or still running — return a cancelled result
+                    final.append(WorkerResult(
+                        worker_id=f"cancelled-{i}",
+                        worker_type=WorkerType.CODER,
+                        output="",
+                        confidence=0.0,
+                        elapsed_ms=0.0,
+                        error="Cancelled by user (ESC)",
+                    ))
+            except (asyncio.CancelledError, Exception) as e:
+                final.append(WorkerResult(
+                    worker_id=f"error-{i}",
+                    worker_type=WorkerType.CODER,
+                    output="",
+                    confidence=0.0,
+                    elapsed_ms=0.0,
+                    error=str(e),
+                ))
+
+        return final
+
     @property
     def goal(self) -> str:
         return self._goal
@@ -161,15 +217,24 @@ class Swarm:
     async def _execute_goal_pipeline(
         self, task: str, enriched_task: str, tools: list | None = None
     ) -> SwarmResult:
-        """Execute a goal pipeline — predetermined worker sequence, no queen routing."""
+        """Execute a goal pipeline — predetermined worker sequence, no queen routing.
+
+        Key optimizations vs general mode:
+        - Shared file-read cache across all workers (prevents duplicate reads)
+        - No parallel provider racing (goal stages already parallelize workers)
+        - Cancellation propagates into running workers immediately on ESC
+        """
         from coolcode.agent.goals import get_goal
-        from coolcode.tools.tracked import make_tracked_tools
+        from coolcode.tools.tracked import FileReadCache, make_tracked_tools
 
         pipeline = get_goal(self._goal)
         if not pipeline:
             raise ValueError(f"Unknown goal: {self._goal}")
 
         self.status.emit("goal", "started", f"goal: {pipeline.name} — {pipeline.description}")
+
+        # Shared file-read cache — all workers in this pipeline share it
+        file_cache = FileReadCache()
 
         all_stage_outputs: list[str] = []
         all_results: list[WorkerResult] = []
@@ -200,11 +265,12 @@ class Swarm:
                 stage_context += "\n--- END ADDITIONAL CONTEXT ---"
 
             # Create workers for all steps in this stage (they run in parallel)
+            # NOTE: No provider racing — goal pipelines already parallelize via multiple steps
             workers: list[WorkerAgent] = []
             for step_idx, step in enumerate(stage.steps):
                 worker_idx = stage_idx * 10 + step_idx
                 worker_id = f"{step.worker_type.value}-goal-{worker_idx}"
-                tracked_tools = make_tracked_tools(self.status, worker_id)
+                tracked_tools = make_tracked_tools(self.status, worker_id, file_cache=file_cache)
                 w = self._create_goal_worker(
                     worker_type=step.worker_type,
                     index=worker_idx,
@@ -215,9 +281,9 @@ class Swarm:
                 workers.append(w)
                 all_worker_types.append(step.worker_type)
 
-            # Execute all steps in this stage in parallel
+            # Execute all steps in this stage — with cancellation support
             coros = [w.execute(stage_context, timeout=step.timeout) for w, step in zip(workers, stage.steps)]
-            stage_results: list[WorkerResult] = await asyncio.gather(*coros)
+            stage_results = await self._gather_with_cancel(coros)
             all_results.extend(stage_results)
 
             # Merge stage results
@@ -286,6 +352,13 @@ class Swarm:
                 success=best_result.success,
             )
             self.learning_bridge.save()
+
+        # Log file cache stats
+        if file_cache.hits > 0:
+            self.status.emit(
+                "goal", "cache",
+                f"file reads saved: {file_cache.hits} cached / {file_cache.hits + file_cache.misses} total"
+            )
 
         self.status.emit("goal", "done", f"{pipeline.name} complete — ho gya bhai!")
 
@@ -458,10 +531,10 @@ class Swarm:
                 consensus_algorithm=self.consensus.algorithm,
             )
 
-        # Step 3: Execute ALL workers in parallel (with enriched context)
+        # Step 3: Execute ALL workers in parallel — with cancellation support
         self.status.emit("swarm", "racing", "saare agents lage hue hain...")
         coros = [w.execute(enriched_task) for w in workers]
-        results: list[WorkerResult] = await asyncio.gather(*coros)
+        results: list[WorkerResult] = await self._gather_with_cancel(coros)
 
         successful = [r for r in results if r.success]
         failed = [r for r in results if not r.success]

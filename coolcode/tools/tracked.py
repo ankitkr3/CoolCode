@@ -3,13 +3,52 @@
 from __future__ import annotations
 
 import functools
+import threading
 from pathlib import Path
 from typing import Any, Callable
 
 from coolcode.status import StatusTracker
 
 
-def make_tracked_tools(status: StatusTracker, worker_id: str = "agent") -> list[Callable]:
+class FileReadCache:
+    """Thread-safe shared cache for file reads across workers in a goal pipeline.
+
+    Prevents multiple workers from re-reading the same file independently.
+    Keyed by (resolved_path, offset, limit).
+    """
+
+    def __init__(self) -> None:
+        self._cache: dict[tuple[str, int, int], str] = {}
+        self._lock = threading.Lock()
+        self.hits = 0
+        self.misses = 0
+
+    def get(self, path: str, offset: int, limit: int) -> str | None:
+        key = (path, offset, limit)
+        with self._lock:
+            result = self._cache.get(key)
+            if result is not None:
+                self.hits += 1
+            return result
+
+    def put(self, path: str, offset: int, limit: int, content: str) -> None:
+        key = (path, offset, limit)
+        with self._lock:
+            self._cache[key] = content
+            self.misses += 1
+
+    def clear(self) -> None:
+        with self._lock:
+            self._cache.clear()
+            self.hits = 0
+            self.misses = 0
+
+
+def make_tracked_tools(
+    status: StatusTracker,
+    worker_id: str = "agent",
+    file_cache: FileReadCache | None = None,
+) -> list[Callable]:
     """Create tool functions that emit status updates when invoked.
 
     These wrap the original tools so the CLI can show real-time activity like:
@@ -35,11 +74,26 @@ def make_tracked_tools(status: StatusTracker, worker_id: str = "agent") -> list[
             File contents with line numbers prefixed.
         """
         path = Path(file_path).resolve()
+        resolved = str(path)
+
+        # Check shared cache first (avoids duplicate reads across parallel workers)
+        if file_cache is not None:
+            cached = file_cache.get(resolved, offset, limit)
+            if cached is not None:
+                lines_count = cached.count("\n")
+                _emit("read (cached)", f"{path.name} ({lines_count} lines)")
+                return cached
+
         _emit("reading", f"{path.name}")
         from coolcode.tools.files import read_file as _read
         result = _read(file_path, offset, limit)
         lines_count = result.count("\n")
         _emit("read", f"{path.name} ({lines_count} lines)")
+
+        # Store in shared cache
+        if file_cache is not None:
+            file_cache.put(resolved, offset, limit, result)
+
         return result
 
     def write_file(file_path: str, content: str) -> str:

@@ -2,7 +2,7 @@
 
 **What if your coding assistant had a hive mind?**
 
-Cool Code is a swarm-powered CLI coding agent where multiple AI agents race, vote, and collaborate to give you the best answer. Built on [LangChain Deep Agents](https://github.com/langchain-ai/deepagents) with Claude + MiniMax M2.5 support.
+Cool Code is a swarm-powered CLI coding agent where multiple AI agents race, vote, and collaborate to give you the best answer. Built on [LangChain Deep Agents](https://github.com/langchain-ai/deepagents) with Claude + MiniMax (M2.5/M2.7) support.
 
 ```
   ____            _    ____          _
@@ -24,6 +24,8 @@ Cool Code is a swarm-powered CLI coding agent where multiple AI agents race, vot
 | Memory | Session-only | HNSW vector memory + PageRank knowledge graph + SQLite persistence |
 | Task Routing | Manual | Learned pattern matching that improves over time |
 | Planning | Manual breakdown | Automatic decomposition across 5 domains |
+| Specialized Workflows | One-size-fits-all | 6 goal pipelines (security audit, code review, debug, ...) |
+| Interactive Control | Wait or kill | ESC to cancel, type mid-execution to inject context |
 
 ## Quick Start
 
@@ -54,7 +56,7 @@ On first launch, Cool Code walks you through setup interactively:
 Step 1: Which provider(s) do you want to use?
 
   1  Claude (Anthropic)        — Best code quality
-  2  MiniMax M2.5              — Cheapest, very fast
+  2  MiniMax (M2.5 / M2.7)    — Fast & affordable
   3  Both (parallel racing)    — Best of both worlds
 
 Choose (1/2/3): 3
@@ -71,10 +73,12 @@ Enter claude API key: sk-ant-...
 
 Step 2: Select a minimax model:
 
-  1  MiniMax M2.5               (Best value)
-  2  MiniMax M2.5 Lightning     (Fastest)
+  1  MiniMax M2.7 highspeed     (Fastest)
+  2  MiniMax M2.7               (Best quality)
+  3  MiniMax M2.5               (Best value)
+  4  MiniMax M2.5 highspeed     (Fast & cheap)
 
-Choose (1-2) [default: 1]: 1
+Choose (1-4) [default: 1]: 1
 
 Enter minimax API key: ...
 
@@ -134,27 +138,71 @@ User Task
     Best Answer + Stats
 ```
 
+### Goal Pipeline Flow
+
+When a goal is active (`/goal cyber-security`, `/goal code-review`, etc.), the queen is bypassed entirely. Instead, a predetermined pipeline of specialized workers runs in stages:
+
+```
+User Task + Active Goal
+    │
+    ▼
+┌──────────────────────────────────────┐
+│  Stage 1: Research                   │
+│  ┌────────────────────────────────┐  │
+│  │ researcher — Attack Surface    │  │  ← Shared file-read cache
+│  └────────────────────────────────┘  │    across all workers
+└────────────────┬─────────────────────┘
+                 │ results feed into ▼
+┌──────────────────────────────────────┐
+│  Stage 2: Parallel Analysis          │
+│  ┌──────────┐ ┌──────────┐ ┌──────┐ │
+│  │Injection │ │Auth/Crypto│ │Supply│ │  ← 3 specialists in parallel
+│  │ Analysis │ │ Analysis  │ │Chain │ │    (no provider racing)
+│  └──────────┘ └──────────┘ └──────┘ │
+└────────────────┬─────────────────────┘
+                 │ results feed into ▼
+┌──────────────────────────────────────┐
+│  Stage 3: Consolidation              │
+│  ┌────────────────────────────────┐  │
+│  │ reviewer — Deduplicate & Score │  │
+│  └────────────────────────────────┘  │
+└────────────────┬─────────────────────┘
+                 │ results feed into ▼
+┌──────────────────────────────────────┐
+│  Stage 4: Remediation Roadmap        │
+│  ┌────────────────────────────────┐  │
+│  │ planner — Prioritized Fixes    │  │
+│  └────────────────────────────────┘  │
+└────────────────┬─────────────────────┘
+                 ▼
+    Final Report + Stats
+```
+
 ## Architecture
 
 ```
 coolcode/
 ├── cli.py                  # Interactive REPL + one-shot CLI
 ├── config.py               # Auto-detects providers from env vars
+├── learner.py              # WorkflowLearner — learns what works over time
 ├── agent/
-│   ├── swarm.py            # Hive mind orchestrator
+│   ├── swarm.py            # Hive mind orchestrator (with cancellation + file cache)
 │   ├── queen.py            # 3 queen types (Coordinator, Evaluator, Delegator)
 │   ├── worker.py           # 8 worker types (Coder, Reviewer, Debugger, ...)
 │   ├── consensus.py        # 5 consensus algorithms
-│   └── router.py           # Learned task routing
+│   ├── router.py           # Learned task routing
+│   └── goals.py            # 6 goal pipelines (code-review, cyber-security, ...)
 ├── memory/
 │   ├── vector_store.py     # HNSW vector memory (sub-ms search)
 │   ├── knowledge_graph.py  # PageRank + community detection
 │   ├── collective.py       # Shared memory (LRU cache + SQLite)
-│   └── scoped.py           # 3-scope memory (project/local/user)
+│   ├── scoped.py           # 3-scope memory (project/local/user)
+│   └── learning_bridge.py  # Connects all memory subsystems
 ├── llm/
 │   └── provider.py         # Claude + MiniMax with failover & cost routing
 ├── tools/
 │   ├── files.py            # read, write, edit, list, glob
+│   ├── tracked.py          # Tracked tools with shared file-read cache
 │   ├── shell.py            # Shell execution with safety checks
 │   ├── search.py           # Grep + definition finder
 │   └── git.py              # Git operations
@@ -179,9 +227,34 @@ coolcode/
 - **Byzantine**: Fault-tolerant (tolerates f < n/3 faulty agents)
 - **Gossip**: Epidemic-style convergence
 
+### 6 Goal Pipelines
+
+Goals are predetermined multi-stage workflows that bypass generic queen routing for domain-specific tasks. Each goal runs a pipeline of specialized workers with shared file caching.
+
+| Goal | Description | Stages |
+|---|---|---|
+| `/goal code-review` | Deep code review — correctness, security, performance, style | 3 (scan → review → remediation plan) |
+| `/goal cyber-security` | World-class security audit — OWASP, CWE, SANS, supply chain | 4 (attack surface → 3 parallel analyses → consolidation → roadmap) |
+| `/goal build-feature` | Full feature lifecycle — plan, implement, test, review | 4 |
+| `/goal debug` | Scientific debugging — observe, hypothesize, test, fix | 3 |
+| `/goal explain` | Architecture explanation — structure, data flow, design decisions | 2 |
+| `/goal optimize` | Performance optimization — profile, identify, fix bottlenecks | 3 |
+| `/goal general` | Default mode — queen routes everything | 1 |
+
+Goal pipelines include:
+- **Shared file-read cache** — workers in the same pipeline don't re-read the same files
+- **No provider racing** — goals already parallelize via multiple workers per stage
+- **Stage-level context passing** — each stage sees results from all previous stages
+- **Immediate ESC cancellation** — pressing ESC cancels all running workers, not just between stages
+
+### Interactive Controls
+
+- **ESC** — cancel current execution immediately (all workers stop gracefully)
+- **Type + Enter** — inject additional context mid-execution without stopping
+
 ### Multi-Provider LLM
 - **Claude** (Sonnet, Opus, Haiku) — best code quality
-- **MiniMax M2.5** — 80.2% SWE-Bench, 10-20x cheaper than Opus
+- **MiniMax** (M2.7, M2.7-highspeed, M2.5, M2.5-highspeed) — fast and affordable
 - **Automatic failover**: if one provider fails, the other takes over
 - **Cost-based routing**: MiniMax for cheap tasks, Claude for quality-critical ones
 - **Live switching**: `/model claude`, `/model minimax`, `/model both`
@@ -213,7 +286,15 @@ coolcode/
 | `/model minimax` | Switch to MiniMax only |
 | `/model both` | Enable parallel racing (both providers) |
 | `/model claude:claude-opus-4-6` | Switch Claude to a specific model |
-| `/stats` | Show provider performance stats |
+| `/goal` | Show current goal + available goals |
+| `/goal code-review` | Deep code review mode |
+| `/goal cyber-security` | Security audit (OWASP/CWE/SANS) |
+| `/goal build-feature` | Plan → implement → test → review |
+| `/goal debug` | Diagnose → fix → verify |
+| `/goal explain` | Architecture explanation |
+| `/goal optimize` | Performance optimization |
+| `/goal general` | Back to default (queen routes everything) |
+| `/stats` | Show provider stats, learnings, and memory |
 | `/help` | Show all commands |
 | `quit` | Exit Cool Code |
 
@@ -235,13 +316,27 @@ Options:
 
 ## Supported Models
 
-| Provider | Model | Speed | Cost (per 1M tokens) |
+| Provider | Model | Tier | Cost (per 1M tokens) |
 |---|---|---|---|
 | Claude | claude-sonnet-4-6 | Balanced | $3 in / $15 out |
 | Claude | claude-opus-4-6 | Highest quality | $15 in / $75 out |
 | Claude | claude-haiku-4-5 | Fastest | $0.80 in / $4 out |
-| MiniMax | MiniMax-M2.5 | 50 tok/s | $0.15 in / $1.20 out |
-| MiniMax | MiniMax-M2.5-Lightning | 100 tok/s | $0.30 in / $2.40 out |
+| MiniMax | MiniMax-M2.7-highspeed | Fastest | $0.50 in / $2.00 out |
+| MiniMax | MiniMax-M2.7 | Best quality | $1.00 in / $4.00 out |
+| MiniMax | MiniMax-M2.5 | Best value | $0.15 in / $1.10 out |
+| MiniMax | MiniMax-M2.5-highspeed | Fast & cheap | $0.30 in / $2.20 out |
+
+## Versioning
+
+Cool Code uses semantic versioning with git tags. You can install a specific version:
+
+```bash
+# Latest
+pip install git+https://github.com/ankitkr3/CoolCode.git
+
+# Specific version (rollback)
+pip install git+https://github.com/ankitkr3/CoolCode.git@v0.1.0
+```
 
 ## Development
 
@@ -249,6 +344,7 @@ Options:
 git clone https://github.com/ankitkr3/CoolCode.git
 cd CoolCode
 pip install -e ".[dev]"
+python -m pytest tests/ -v
 ```
 
 ## License
