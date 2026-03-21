@@ -150,7 +150,7 @@ class DaemonServer:
             writer.write(json.dumps(response).encode() + b"\n")
             await writer.drain()
         except (asyncio.TimeoutError, json.JSONDecodeError, ConnectionError) as e:
-            logger.warning(f"Client error: {e}")
+            logger.debug(f"Client disconnected: {e}")  # normal during polling
         finally:
             writer.close()
 
@@ -179,16 +179,30 @@ def daemonize(project_dir: str) -> None:
     if pid > 0:
         os._exit(0)
 
+    # Close inherited file descriptors from parent (CLI terminal)
+    os.close(0)  # stdin
+    os.close(1)  # stdout
+    os.close(2)  # stderr
+
     # Redirect stdout/stderr to log file
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    sys.stdout = open(LOG_FILE, "a")
+    log_fd = os.open(str(LOG_FILE), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    os.dup2(log_fd, 1)  # stdout -> log file
+    os.dup2(log_fd, 2)  # stderr -> log file
+    sys.stdout = os.fdopen(1, "w")
     sys.stderr = sys.stdout
 
-    # Set up logging
+    # Remove ALL inherited log handlers (they still point to CLI terminal)
+    root_logger = logging.getLogger()
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+
+    # Set up fresh logging to the log file
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [daemon] %(levelname)s: %(message)s",
         stream=sys.stdout,
+        force=True,
     )
 
     # Handle signals
