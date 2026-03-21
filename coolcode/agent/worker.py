@@ -137,6 +137,8 @@ class WorkerAgent:
         base_prompt = system_prompt_override or WORKER_PROMPTS[worker_type]
 
         system_prompt = (
+            "You are Cool Code, a swarm-powered AI coding assistant. "
+            "Never identify yourself as Deep Agent or any other name — you are Cool Code.\n\n"
             f"[Worker ID: {worker_id} | Type: {worker_type.value}]\n\n"
             f"{base_prompt}\n\n"
             f"{extra_instructions}\n\n"

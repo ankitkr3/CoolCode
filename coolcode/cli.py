@@ -15,10 +15,15 @@ import logging
 import os
 import sys
 import time
+import warnings
 from pathlib import Path
 
 # Suppress HuggingFace tokenizers fork warning (we use sentence-transformers for embeddings)
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+# Suppress sklearn/numpy version mismatch warning from sentence-transformers
+warnings.filterwarnings("ignore", message=".*A NumPy version.*", category=UserWarning)
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="sklearn")
 
 import click
 from rich.console import Console
@@ -48,14 +53,33 @@ def _setup_logging(verbose: bool) -> None:
     )
 
 
+def _get_version() -> str:
+    """Read version from package metadata, falling back to pyproject.toml."""
+    try:
+        from importlib.metadata import version
+        return version("coolcode")
+    except Exception:
+        pass
+    # Fallback: read pyproject.toml directly
+    try:
+        toml_path = Path(__file__).parent.parent / "pyproject.toml"
+        for line in toml_path.read_text().splitlines():
+            if line.strip().startswith("version"):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return "dev"
+
+
 def _print_banner() -> None:
+    ver = _get_version()
     banner = Text()
     banner.append("  ____            _    ____          _      \n", style="bold cyan")
     banner.append(" / ___|___   ___ | |  / ___|___   __| | ___ \n", style="bold cyan")
     banner.append("| |   / _ \\ / _ \\| | | |   / _ \\ / _` |/ _ \\\n", style="bold cyan")
     banner.append("| |__| (_) | (_) | | | |__| (_) | (_| |  __/\n", style="bold cyan")
     banner.append(" \\____\\___/ \\___/|_|  \\____\\___/ \\__,_|\\___|\n", style="bold cyan")
-    banner.append("\n  Swarm-powered coding agent | v0.1.0\n", style="dim")
+    banner.append(f"\n  Swarm-powered coding agent | v{ver}\n", style="dim")
     console.print(banner)
 
 
@@ -287,6 +311,27 @@ def _create_swarm(config: CoolCodeConfig, strategy: str) -> Swarm:
     )
 
 
+def _flush_stdin() -> None:
+    """Flush any pending bytes from stdin.
+
+    Rich Live sends cursor position queries (CPR: \\x1b[6n]) to the terminal.
+    The terminal responds with \\x1b[<row>;<col>R which can leak into
+    prompt-toolkit's input buffer, appearing as garbage like '[63;1R'.
+    This drains all pending bytes after Rich Live exits.
+    """
+    import select
+    try:
+        import termios
+        # Only flush if stdin is a real terminal
+        if not sys.stdin.isatty():
+            return
+        # Drain all pending bytes (non-blocking)
+        while select.select([sys.stdin], [], [], 0.0)[0]:
+            os.read(sys.stdin.fileno(), 4096)
+    except (ImportError, OSError, ValueError):
+        pass  # Not a real terminal or stdin closed
+
+
 def _start_keyboard_thread(swarm: Swarm, log_lines: list[str], cancel_event: asyncio.Event, loop: asyncio.AbstractEventLoop):
     """Start a background thread for keyboard input (ESC and text injection).
 
@@ -377,10 +422,23 @@ async def _run_task(task: str, swarm: Swarm) -> None:
     loop = asyncio.get_event_loop()
     kb_thread = _start_keyboard_thread(swarm, log_lines, cancel_event, loop)
 
-    with Live(console=console, refresh_per_second=4, transient=True) as live:
-        hindi_timer = time.monotonic()
-        hindi_msg = status_tracker.next_hindi()
+    hindi_timer = time.monotonic()
+    hindi_msg = status_tracker.next_hindi()
 
+    # Show the Live panel immediately with a loading message (no delay)
+    initial_display = f"  [bold yellow]{hindi_msg}[/bold yellow]\n\n  [dim]Starting...[/dim]"
+    with Live(
+        Panel(
+            initial_display,
+            title="[bold cyan]⚡ Cool Code[/bold cyan]",
+            border_style="cyan",
+            subtitle="[dim]0.0s | ESC=cancel | type+Enter=add info[/dim]",
+            padding=(1, 2),
+        ),
+        console=console,
+        refresh_per_second=4,
+        transient=True,
+    ) as live:
         while not swarm_task.done():
             update = await status_tracker.get(timeout=0.25)
 
@@ -420,6 +478,10 @@ async def _run_task(task: str, swarm: Swarm) -> None:
 
     # Signal keyboard thread to stop
     cancel_event.set()
+
+    # Flush any pending terminal escape sequences (CPR responses like \x1b[63;1R)
+    # that Rich Live's cursor position queries may have left in stdin
+    _flush_stdin()
 
     # Handle cancellation
     if swarm._cancelled and not swarm_task.done():

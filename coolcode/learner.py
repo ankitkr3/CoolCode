@@ -206,8 +206,13 @@ class WorkflowLearner:
             "api_error": False,
         })
 
-    def suggest_worker_count(self, task: str) -> int:
-        """Suggest optimal worker count based on learned task complexity."""
+    def suggest_worker_count(self, task: str, configured_count: int = 3) -> int:
+        """Suggest optimal worker count based on learned task complexity.
+
+        Returns a count between 2 and configured_count. Never returns 1 —
+        having at least 2 workers allows consensus and provider racing to work.
+        """
+        min_workers = min(2, configured_count)  # floor: always at least 2
         keywords = set(self._extract_keywords(task))
         matching_patterns = []
 
@@ -217,17 +222,17 @@ class WorkflowLearner:
                 matching_patterns.append(p)
 
         if not matching_patterns:
-            return 1  # default: single worker for unknown tasks
+            return configured_count  # unknown task — use full configured count
 
         avg_confidence = sum(p.avg_confidence for p in matching_patterns) / len(matching_patterns)
 
         # Low confidence tasks benefit from more workers (racing)
         if avg_confidence < 0.5:
-            return 3
-        elif avg_confidence < 0.7:
-            return 2
+            return configured_count
+        elif avg_confidence < 0.8:
+            return max(min_workers, configured_count - 1)
         else:
-            return 1  # high confidence = one worker is enough, save tokens
+            return min_workers  # high confidence — still use 2 for consensus
 
     def suggest_skip_workers(self, task: str) -> list[str]:
         """Suggest worker types to skip based on past failures."""

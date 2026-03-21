@@ -486,7 +486,7 @@ class Swarm:
             worker_types = [WorkerType.CODER]  # fallback
 
         # Learner suggests worker count based on past complexity
-        suggested_count = self.learner.suggest_worker_count(task)
+        suggested_count = self.learner.suggest_worker_count(task, configured_count=self._num_workers)
         if suggested_count < self._num_workers:
             self.status.emit(
                 "learner",
