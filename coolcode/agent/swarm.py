@@ -257,7 +257,7 @@ class Swarm:
         index: int,
         prompt_override: str,
         tools: list | None = None,
-        timeout: int = 180,
+        timeout: int = 0,
     ) -> WorkerAgent:
         """Create a worker with a goal-specific system prompt override."""
         model = self.llm_provider.get_model()

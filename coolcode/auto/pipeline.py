@@ -39,7 +39,7 @@ class PipelineStage:
     prompt: str
     is_gate: bool = False  # pause for human approval after this stage
     estimated_cost: float = 0.0
-    timeout: int = 180
+    timeout: int = 600
 
 
 @dataclass

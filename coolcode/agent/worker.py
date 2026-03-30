@@ -84,14 +84,14 @@ WORKER_PROMPTS: dict[WorkerType, str] = {
 
 # Per-worker-type timeout in seconds
 WORKER_TIMEOUTS: dict[WorkerType, int] = {
-    WorkerType.CODER: 180,
-    WorkerType.REVIEWER: 120,
-    WorkerType.PLANNER: 90,
-    WorkerType.RESEARCHER: 180,
-    WorkerType.DEBUGGER: 180,
-    WorkerType.TESTER: 180,
-    WorkerType.REFACTORER: 180,
-    WorkerType.SECURITY: 120,
+    WorkerType.CODER: 600,
+    WorkerType.REVIEWER: 180,
+    WorkerType.PLANNER: 180,
+    WorkerType.RESEARCHER: 600,
+    WorkerType.DEBUGGER: 300,
+    WorkerType.TESTER: 300,
+    WorkerType.REFACTORER: 300,
+    WorkerType.SECURITY: 180,
 }
 
 

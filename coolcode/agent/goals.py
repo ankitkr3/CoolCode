@@ -25,7 +25,7 @@ class GoalStep:
     worker_type: WorkerType
     prompt_override: str  # replaces default WORKER_PROMPTS for this step
     label: str  # human-readable step name, e.g. "OWASP Analysis"
-    timeout: int = 180
+    timeout: int = 0  # 0 = use per-worker-type timeout from WORKER_TIMEOUTS
 
 
 @dataclass
@@ -83,7 +83,7 @@ _CODE_REVIEW = GoalPipeline(
             GoalStep(
                 worker_type=WorkerType.REVIEWER,
                 label="Deep Code Review",
-                timeout=180,
+                timeout=0,
                 prompt_override=(
                     "You are a SENIOR CODE REVIEWER performing a comprehensive review.\n\n"
                     "You have the codebase map from Stage 1. Now do a DEEP review.\n\n"
@@ -178,7 +178,7 @@ _CYBER_SECURITY = GoalPipeline(
             GoalStep(
                 worker_type=WorkerType.RESEARCHER,
                 label="Attack Surface Mapping",
-                timeout=180,
+                timeout=0,
                 prompt_override=(
                     "You are a SECURITY RESEARCHER mapping the attack surface.\n\n"
                     "Systematically identify ALL entry points and trust boundaries:\n\n"
@@ -217,7 +217,7 @@ _CYBER_SECURITY = GoalPipeline(
                 GoalStep(
                     worker_type=WorkerType.SECURITY,
                     label="Injection & Input Validation (OWASP A03)",
-                    timeout=180,
+                    timeout=0,
                     prompt_override=(
                         "You are a SECURITY ENGINEER specializing in INJECTION VULNERABILITIES.\n\n"
                         "Using the attack surface map from Stage 1, analyze for:\n\n"
@@ -266,7 +266,7 @@ _CYBER_SECURITY = GoalPipeline(
                 GoalStep(
                     worker_type=WorkerType.SECURITY,
                     label="Auth, Crypto & Data Exposure (OWASP A01/A02/A04/A07)",
-                    timeout=180,
+                    timeout=0,
                     prompt_override=(
                         "You are a SECURITY ENGINEER specializing in AUTH, CRYPTO & DATA PROTECTION.\n\n"
                         "Using the attack surface map from Stage 1, analyze for:\n\n"
@@ -308,7 +308,7 @@ _CYBER_SECURITY = GoalPipeline(
                 GoalStep(
                     worker_type=WorkerType.SECURITY,
                     label="Supply Chain, Secrets & Config (OWASP A05/A06/A08/A09)",
-                    timeout=180,
+                    timeout=0,
                     prompt_override=(
                         "You are a SECURITY ENGINEER specializing in SUPPLY CHAIN & CONFIGURATION.\n\n"
                         "Using the attack surface map from Stage 1, analyze for:\n\n"
@@ -495,7 +495,7 @@ _BUILD_FEATURE = GoalPipeline(
             GoalStep(
                 worker_type=WorkerType.TESTER,
                 label="Test Writing",
-                timeout=180,
+                timeout=0,
                 prompt_override=(
                     "You are writing tests for the feature implemented in Stage 2.\n\n"
                     "COVERAGE REQUIREMENTS:\n"
@@ -556,7 +556,7 @@ _DEBUG = GoalPipeline(
             GoalStep(
                 worker_type=WorkerType.RESEARCHER,
                 label="Investigation",
-                timeout=180,
+                timeout=0,
                 prompt_override=(
                     "You are INVESTIGATING a reported bug.\n\n"
                     "1. Find the relevant code — use grep_search for error messages, function names\n"
@@ -580,7 +580,7 @@ _DEBUG = GoalPipeline(
             GoalStep(
                 worker_type=WorkerType.DEBUGGER,
                 label="Root Cause Analysis",
-                timeout=180,
+                timeout=0,
                 prompt_override=(
                     "You are performing ROOT CAUSE ANALYSIS on the investigation from Stage 1.\n\n"
                     "Apply the SCIENTIFIC METHOD:\n\n"
@@ -604,7 +604,7 @@ _DEBUG = GoalPipeline(
             GoalStep(
                 worker_type=WorkerType.CODER,
                 label="Fix Implementation",
-                timeout=180,
+                timeout=0,
                 prompt_override=(
                     "You are FIXING the bug identified in Stage 2.\n\n"
                     "RULES:\n"
@@ -625,7 +625,7 @@ _DEBUG = GoalPipeline(
             GoalStep(
                 worker_type=WorkerType.TESTER,
                 label="Regression Tests",
-                timeout=180,
+                timeout=0,
                 prompt_override=(
                     "You are writing REGRESSION TESTS for the bug fix from Stage 3.\n\n"
                     "Write tests that:\n"
@@ -661,7 +661,7 @@ _EXPLAIN = GoalPipeline(
             GoalStep(
                 worker_type=WorkerType.RESEARCHER,
                 label="Deep Research",
-                timeout=180,
+                timeout=0,
                 prompt_override=(
                     "You are RESEARCHING code architecture for an explanation.\n\n"
                     "Explore THOROUGHLY — this is about understanding, not speed:\n\n"
@@ -726,7 +726,7 @@ _OPTIMIZE = GoalPipeline(
             GoalStep(
                 worker_type=WorkerType.RESEARCHER,
                 label="Performance Profiling",
-                timeout=180,
+                timeout=0,
                 prompt_override=(
                     "You are PROFILING code for performance optimization.\n\n"
                     "Analyze through STATIC ANALYSIS (read the code, trace execution):\n\n"
@@ -758,7 +758,7 @@ _OPTIMIZE = GoalPipeline(
                 GoalStep(
                     worker_type=WorkerType.REFACTORER,
                     label="Algorithm & Logic Optimization",
-                    timeout=180,
+                    timeout=0,
                     prompt_override=(
                         "You are optimizing ALGORITHMS AND LOGIC based on Stage 1 profiling.\n\n"
                         "Focus on:\n"
@@ -777,7 +777,7 @@ _OPTIMIZE = GoalPipeline(
                 GoalStep(
                     worker_type=WorkerType.REFACTORER,
                     label="I/O & Resource Optimization",
-                    timeout=180,
+                    timeout=0,
                     prompt_override=(
                         "You are optimizing I/O AND RESOURCE USAGE based on Stage 1 profiling.\n\n"
                         "Focus on:\n"
@@ -801,7 +801,7 @@ _OPTIMIZE = GoalPipeline(
             GoalStep(
                 worker_type=WorkerType.TESTER,
                 label="Performance Verification",
-                timeout=180,
+                timeout=0,
                 prompt_override=(
                     "You are VERIFYING that optimizations from Stage 2 didn't break anything.\n\n"
                     "1. Run existing tests (execute_shell) — ALL must pass\n"
