@@ -605,10 +605,26 @@ def _interactive_loop(config: CoolCodeConfig, strategy: str) -> None:
     """Run the interactive REPL with persistent swarm (session memory)."""
     from prompt_toolkit import PromptSession
     from prompt_toolkit.history import FileHistory
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.keys import Keys
 
     history_path = os.path.expanduser("~/.coolcode/history")
     os.makedirs(os.path.dirname(history_path), exist_ok=True)
-    session = PromptSession(history=FileHistory(history_path))
+
+    paste_bindings = KeyBindings()
+
+    @paste_bindings.add(Keys.BracketedPaste)
+    def _handle_paste(event):
+        """Treat pasted text as a single block instead of splitting on newlines."""
+        data = event.data
+        # Replace newlines with spaces so multi-line pastes become one prompt
+        cleaned = data.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+        event.current_buffer.insert_text(cleaned)
+
+    session = PromptSession(
+        history=FileHistory(history_path),
+        key_bindings=paste_bindings,
+    )
 
     _print_banner()
 
