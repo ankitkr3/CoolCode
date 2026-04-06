@@ -309,11 +309,15 @@ def _create_swarm(config: CoolCodeConfig, strategy: str, cost_tracker: CostTrack
     """Create a Swarm instance that persists across the session."""
     llm_provider = LLMProvider(config, strategy=strategy)
     collective_memory = CollectiveMemory(config.memory.sqlite_path)
+    # NDJSON transcript for post-hoc debugging (port of Claude Code pattern)
+    transcript_path = str(
+        Path(config.project_dir) / ".coolcode" / "transcripts" / f"{int(time.time())}.ndjson"
+    )
     return Swarm(
         config=config,
         llm_provider=llm_provider,
         collective_memory=collective_memory,
-        status_tracker=StatusTracker(),
+        status_tracker=StatusTracker(transcript_path=transcript_path),
         cost_tracker=cost_tracker or CostTracker(),
     )
 
@@ -404,7 +408,10 @@ def _start_keyboard_thread(swarm: Swarm, log_lines: list[str], cancel_event: asy
 async def _run_task(task: str, swarm: Swarm) -> None:
     """Execute a single task through a persistent swarm with live progress display."""
     # Refresh the status tracker for this task (new queue, same swarm)
-    swarm.status = StatusTracker()
+    transcript_path = str(
+        Path(swarm.config.project_dir) / ".coolcode" / "transcripts" / f"{int(time.time())}.ndjson"
+    )
+    swarm.status = StatusTracker(transcript_path=transcript_path)
     status_tracker = swarm.status
 
     providers = swarm.llm_provider.available_providers
@@ -431,23 +438,94 @@ async def _run_task(task: str, swarm: Swarm) -> None:
 
     hindi_timer = time.monotonic()
     hindi_msg = status_tracker.next_hindi()
+    # Animated spinner frames (port of CompanionSprite idea — gives "alive" signal)
+    spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    spinner_idx = 0
 
-    # Show the Live panel immediately with a loading message (no delay)
-    initial_display = f"  [bold yellow]{hindi_msg}[/bold yellow]\n\n  [dim]Starting...[/dim]"
+    def _build_worker_table() -> Table:
+        """Live per-worker status table."""
+        table = Table(
+            show_header=True,
+            header_style="bold cyan",
+            border_style="dim",
+            expand=True,
+            padding=(0, 1),
+        )
+        table.add_column("Worker", style="bold", no_wrap=True)
+        table.add_column("State", width=10)
+        table.add_column("Action", width=14)
+        table.add_column("Detail", overflow="ellipsis", no_wrap=True)
+        table.add_column("Tokens", justify="right", width=14)
+        table.add_column("Time", justify="right", width=7)
+
+        state_style = {
+            "pending": "[dim]pending[/dim]",
+            "running": "[yellow]running[/yellow]",
+            "done": "[green]done[/green]",
+            "failed": "[red]failed[/red]",
+            "timeout": "[red]timeout[/red]",
+            "cancelled": "[yellow]cancelled[/yellow]",
+        }
+
+        snapshots = status_tracker.worker_snapshots()
+        if not snapshots:
+            table.add_row("[dim]waiting for workers...[/dim]", "", "", "", "", "")
+            return table
+
+        for snap in snapshots[:12]:  # cap at 12 rows
+            tokens = (
+                f"{snap.tokens_in}→{snap.tokens_out}"
+                if snap.tokens_in or snap.tokens_out
+                else "[dim]-[/dim]"
+            )
+            elapsed_s = snap.elapsed_ms / 1000.0
+            table.add_row(
+                snap.worker_id,
+                state_style.get(snap.state, snap.state),
+                snap.action or "[dim]-[/dim]",
+                snap.detail or "[dim]-[/dim]",
+                tokens,
+                f"{elapsed_s:4.1f}s",
+            )
+        return table
+
+    def _build_display():
+        """Assemble the composite live display: spinner + worker table + activity tail."""
+        from rich.console import Group
+
+        nonlocal spinner_idx
+        spinner_idx = (spinner_idx + 1) % len(spinner_frames)
+        spinner = spinner_frames[spinner_idx]
+
+        header = f"  {spinner} [bold yellow]{hindi_msg}[/bold yellow]"
+        worker_table = _build_worker_table()
+        tail = log_lines[-8:] if log_lines else ["  [dim]no activity yet...[/dim]"]
+        activity = "\n".join(tail)
+
+        return Group(
+            header,
+            "",
+            worker_table,
+            "",
+            "[bold dim]Recent activity:[/bold dim]",
+            activity,
+        )
+
+    # Show the Live panel immediately with a loading message
     with Live(
         Panel(
-            initial_display,
+            _build_display(),
             title="[bold cyan]⚡ Cool Code[/bold cyan]",
             border_style="cyan",
             subtitle="[dim]0.0s | ESC=cancel | type+Enter=add info[/dim]",
             padding=(1, 2),
         ),
         console=console,
-        refresh_per_second=4,
+        refresh_per_second=8,
         transient=True,
     ) as live:
         while not swarm_task.done():
-            update = await status_tracker.get(timeout=0.25)
+            update = await status_tracker.get(timeout=0.125)
 
             if update:
                 icons = {
@@ -467,18 +545,17 @@ async def _run_task(task: str, swarm: Swarm) -> None:
                 hindi_msg = status_tracker.next_hindi()
                 hindi_timer = time.monotonic()
 
-            # Build display — show last 15 log lines
-            visible = log_lines[-15:]
             elapsed_now = time.monotonic() - start
-            display_text = f"  [bold yellow]{hindi_msg}[/bold yellow]\n\n" + "\n".join(visible)
-
             border = "red" if cancel_event.is_set() else "cyan"
             live.update(
                 Panel(
-                    display_text,
+                    _build_display(),
                     title="[bold cyan]⚡ Cool Code[/bold cyan]",
                     border_style=border,
-                    subtitle=f"[dim]${swarm.cost_tracker.session_total:.4f} | {elapsed_now:.1f}s | ESC=cancel | type+Enter=add info[/dim]",
+                    subtitle=(
+                        f"[dim]${swarm.cost_tracker.session_total:.4f} | "
+                        f"{elapsed_now:.1f}s | ESC=cancel | type+Enter=add info[/dim]"
+                    ),
                     padding=(1, 2),
                 )
             )

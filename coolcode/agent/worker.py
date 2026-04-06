@@ -206,6 +206,23 @@ class WorkerAgent:
         """
         if timeout <= 0:
             timeout = WORKER_TIMEOUTS.get(self.worker_type, 180)
+
+        # Token budget check — truncate input if it would overflow context
+        from coolcode.llm.tokens import check_budget, truncate_to_budget
+
+        model_name = ""
+        try:
+            m = self._agent if hasattr(self._agent, "model") else None
+            model_name = getattr(m, "model", "") if m else ""
+        except Exception:
+            pass
+        fits, input_toks, available, warn = check_budget(task, model_name, max_output_tokens=16_384)
+        if not fits:
+            self._emit("budget", f"truncating input: {input_toks} tokens too large")
+            task = truncate_to_budget(task, max_tokens=100_000, model=model_name)
+        elif warn:
+            self._emit("budget", f"{input_toks} in / {available} out available")
+
         self._emit("started", f"working on: {task[:80]}...")
         start = time.monotonic()
 

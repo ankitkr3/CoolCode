@@ -10,9 +10,12 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any
 
 from rich.console import Console
@@ -134,6 +137,71 @@ STAGE_TEMPLATES = [
 ]
 
 
+class PipelineStateStore:
+    """Persists autonomous pipeline state to disk so execution can be resumed.
+
+    State file: <project>/.coolcode/pipeline_state/<task_hash>.json
+
+    Each stage completion saves all_stage_outputs + stage_results + total_cost.
+    On a new pipeline run with the same task, we offer to resume from the
+    last completed stage instead of restarting from scratch.
+    """
+
+    def __init__(self, project_dir: str):
+        self.root = Path(project_dir) / ".coolcode" / "pipeline_state"
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    def _path_for(self, task: str) -> Path:
+        h = hashlib.sha1(task.encode("utf-8")).hexdigest()[:16]
+        return self.root / f"{h}.json"
+
+    def save(
+        self,
+        task: str,
+        stages_completed: int,
+        total_stages: int,
+        stage_results: list[StageResult],
+        all_stage_outputs: list[str],
+        total_cost: float,
+    ) -> None:
+        """Atomically save pipeline state after a stage completes."""
+        path = self._path_for(task)
+        payload = {
+            "task": task,
+            "stages_completed": stages_completed,
+            "total_stages": total_stages,
+            "total_cost": total_cost,
+            "stage_results": [asdict(sr) for sr in stage_results],
+            "all_stage_outputs": all_stage_outputs,
+            "saved_at": time.time(),
+        }
+        tmp = path.with_suffix(".json.tmp")
+        try:
+            tmp.write_text(json.dumps(payload, indent=2))
+            tmp.replace(path)
+        except Exception as e:
+            logger.warning(f"Failed to save pipeline state: {e}")
+
+    def load(self, task: str) -> dict | None:
+        """Load checkpoint if one exists for this task."""
+        path = self._path_for(task)
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text())
+        except (json.JSONDecodeError, IOError) as e:
+            logger.warning(f"Corrupt pipeline state {path}: {e}")
+            return None
+
+    def clear(self, task: str) -> None:
+        """Delete checkpoint (call on successful completion)."""
+        path = self._path_for(task)
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 class AutoPipeline:
     """Orchestrates autonomous multi-stage pipelines.
 
@@ -141,7 +209,8 @@ class AutoPipeline:
     1. Plan: decompose task into stages (or use templates)
     2. Show plan to user with cost estimates
     3. Execute stages sequentially with:
-       - Git checkpoints before each stage
+       - State checkpoints after each stage (resume on crash/timeout)
+       - Git checkpoints before each stage (rollback)
        - Human gates at configurable intervals
        - Cost tracking throughout
     4. Return final result
@@ -156,6 +225,7 @@ class AutoPipeline:
         self.gate_frequency = gate_frequency
         self.gate_manager = GateManager()
         self.checkpoint_manager = CheckpointManager(swarm.config.project_dir)
+        self.state_store = PipelineStateStore(swarm.config.project_dir)
 
     def plan(self, task: str) -> PipelinePlan:
         """Create a pipeline plan for the given task.
@@ -218,13 +288,38 @@ class AutoPipeline:
         console.print(f"[bold]Gates:[/bold] {sum(1 for s in plan.stages if s.is_gate)} approval points")
         console.print()
 
-    async def execute(self, plan: PipelinePlan) -> AutoResult:
-        """Execute the pipeline with gates and checkpoints."""
+    async def execute(self, plan: PipelinePlan, resume: bool = True) -> AutoResult:
+        """Execute the pipeline with gates and checkpoints.
+
+        If ``resume`` is True and a saved state exists for this task, the
+        pipeline resumes from the last completed stage instead of restarting.
+        """
         stage_results: list[StageResult] = []
         all_stage_outputs: list[str] = []
         total_cost = 0.0
+        start_stage = 0
+
+        # Try to resume from a previous checkpoint
+        if resume:
+            saved = self.state_store.load(plan.task)
+            if saved and saved.get("stages_completed", 0) > 0:
+                completed = saved["stages_completed"]
+                console.print(
+                    f"[yellow]Found checkpoint:[/yellow] {completed}/{saved['total_stages']} "
+                    f"stages complete, cost ${saved['total_cost']:.4f}"
+                )
+                console.print("[dim]Resuming from last checkpoint...[/dim]")
+                start_stage = completed
+                total_cost = saved["total_cost"]
+                all_stage_outputs = list(saved.get("all_stage_outputs", []))
+                for sr in saved.get("stage_results", []):
+                    stage_results.append(StageResult(**sr))
 
         for stage_idx, stage in enumerate(plan.stages):
+            # Skip already-completed stages on resume
+            if stage_idx < start_stage:
+                continue
+
             # Check cancellation
             if self.swarm._cancelled:
                 break
@@ -276,6 +371,16 @@ class AutoPipeline:
             stage_results.append(stage_result)
             all_stage_outputs.append(output)
 
+            # Persist state so we can resume if the next stage crashes/times out
+            self.state_store.save(
+                task=plan.task,
+                stages_completed=stage_idx + 1,
+                total_stages=plan.total_stages,
+                stage_results=stage_results,
+                all_stage_outputs=all_stage_outputs,
+                total_cost=total_cost,
+            )
+
             self.swarm.status.emit(
                 "auto", "stage done",
                 f"{stage.description} — ${stage_cost:.4f}, {elapsed:.0f}ms"
@@ -323,9 +428,11 @@ class AutoPipeline:
                     # The loop will continue but we don't go back — the corrective
                     # context will be picked up by the next stage
 
-        # Cleanup checkpoints on success
-        if not any(sr.success is False for sr in stage_results):
+        # Cleanup checkpoints + state store on success
+        all_ok = all(sr.success for sr in stage_results)
+        if all_ok:
             self.checkpoint_manager.cleanup()
+            self.state_store.clear(plan.task)
 
         return AutoResult(
             task=plan.task,

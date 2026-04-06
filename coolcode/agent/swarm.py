@@ -405,9 +405,11 @@ class Swarm:
                 relevance_score=quality,
             )
 
-        # Conversation history (persisted)
-        self._conversation_history.append({"role": "assistant", "content": final_output[:1000]})
-        self._save_history()
+        # Conversation history (persisted) — guarded so concurrent executions don't
+        # interleave appends or race on the JSON save.
+        async with self._history_lock:
+            self._conversation_history.append({"role": "assistant", "content": final_output[:1000]})
+            self._save_history()
 
         # Learning bridge
         if best_result:
@@ -505,8 +507,9 @@ class Swarm:
         self.status.emit("swarm", "analyzing", "samajh rha hoon kya karna hai...")
 
         # Add user message to conversation history (persisted)
-        self._conversation_history.append({"role": "user", "content": task})
-        self._save_history()
+        async with self._history_lock:
+            self._conversation_history.append({"role": "user", "content": task})
+            self._save_history()
 
         # Build context from memory + history
         context = self._build_context(task)
@@ -672,8 +675,10 @@ class Swarm:
                 relevance_score=quality,
             )
 
-        # Add assistant response to conversation history
-        self._conversation_history.append({"role": "assistant", "content": final_output[:1000]})
+        # Add assistant response to conversation history (persisted)
+        async with self._history_lock:
+            self._conversation_history.append({"role": "assistant", "content": final_output[:1000]})
+            self._save_history()
 
         # Learning bridge — embed task+result for semantic recall
         if best_result:

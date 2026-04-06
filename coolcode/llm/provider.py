@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import random
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -13,6 +15,44 @@ from langchain_core.messages import BaseMessage
 from coolcode.config import CoolCodeConfig, LLMConfig
 
 logger = logging.getLogger(__name__)
+
+# Errors worth retrying (transient: rate limits, network hiccups, 5xx)
+_RETRY_ERROR_SUBSTRINGS = (
+    "rate limit",
+    "rate_limit",
+    "429",
+    "503",
+    "502",
+    "504",
+    "timeout",
+    "connection",
+    "temporarily unavailable",
+    "overloaded",
+    "try again",
+)
+
+# Errors that should NOT be retried (auth, invalid request, context too long)
+_PERMANENT_ERROR_SUBSTRINGS = (
+    "401",
+    "403",
+    "invalid api key",
+    "authentication",
+    "invalid_request",
+    "context length",
+    "max_tokens",
+    "context_length_exceeded",
+)
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """Heuristic: decide if an LLM exception is transient and worth retrying."""
+    msg = str(exc).lower()
+    if any(s in msg for s in _PERMANENT_ERROR_SUBSTRINGS):
+        return False
+    if any(s in msg for s in _RETRY_ERROR_SUBSTRINGS):
+        return True
+    # Unknown errors — try once more, but not beyond
+    return True
 
 # Cost per 1M tokens (input, output)
 COST_TABLE: dict[str, tuple[float, float]] = {
@@ -148,30 +188,73 @@ class LLMProvider:
         """
         return [(key, model) for key, model in self._models.items()]
 
-    async def invoke_with_failover(self, messages: list[BaseMessage], **kwargs: Any) -> Any:
-        """Invoke the best-ranked model, falling over to the next on failure."""
+    async def invoke_with_failover(
+        self,
+        messages: list[BaseMessage],
+        max_retries: int = 3,
+        base_delay: float = 1.0,
+        max_delay: float = 30.0,
+        **kwargs: Any,
+    ) -> Any:
+        """Invoke the best-ranked model, retrying transient errors with exponential
+        backoff, then falling over to the next provider on persistent failure.
+
+        Retry strategy per provider:
+            attempt 1: immediate
+            attempt 2: base_delay * 2^0 + jitter
+            attempt 3: base_delay * 2^1 + jitter
+            ...
+
+        Permanent errors (auth, invalid request) skip retries and move on.
+        """
         ranked = self._rank_providers()
         last_error: Exception | None = None
 
         for key in ranked:
             model = self._models[key]
             stats = self._stats[key]
-            start = time.monotonic()
-            try:
-                result = await model.ainvoke(messages, **kwargs)
-                elapsed = (time.monotonic() - start) * 1000
-                stats.total_calls += 1
-                stats.total_latency_ms += elapsed
-                logger.info(f"[{key}] success in {elapsed:.0f}ms")
-                return result
-            except Exception as e:
-                elapsed = (time.monotonic() - start) * 1000
-                stats.total_calls += 1
-                stats.total_failures += 1
-                stats.total_latency_ms += elapsed
-                stats.last_failure_time = time.time()
-                last_error = e
-                logger.warning(f"[{key}] failed ({e}), trying next provider...")
+
+            for attempt in range(max_retries):
+                start = time.monotonic()
+                try:
+                    result = await model.ainvoke(messages, **kwargs)
+                    elapsed = (time.monotonic() - start) * 1000
+                    stats.total_calls += 1
+                    stats.total_latency_ms += elapsed
+                    if attempt > 0:
+                        logger.info(
+                            f"[{key}] success in {elapsed:.0f}ms (after {attempt} retries)"
+                        )
+                    else:
+                        logger.info(f"[{key}] success in {elapsed:.0f}ms")
+                    return result
+                except Exception as e:
+                    elapsed = (time.monotonic() - start) * 1000
+                    stats.total_calls += 1
+                    stats.total_failures += 1
+                    stats.total_latency_ms += elapsed
+                    stats.last_failure_time = time.time()
+                    last_error = e
+
+                    if not _is_retryable(e):
+                        logger.warning(
+                            f"[{key}] permanent error ({e}), moving to next provider"
+                        )
+                        break
+
+                    if attempt < max_retries - 1:
+                        # Exponential backoff with jitter
+                        delay = min(base_delay * (2 ** attempt), max_delay)
+                        delay += random.uniform(0, delay * 0.25)  # +0-25% jitter
+                        logger.warning(
+                            f"[{key}] transient error ({e}), retry {attempt + 1}/{max_retries} "
+                            f"in {delay:.1f}s"
+                        )
+                        await asyncio.sleep(delay)
+                    else:
+                        logger.warning(
+                            f"[{key}] exhausted {max_retries} retries, moving to next provider"
+                        )
 
         raise RuntimeError(f"All providers failed. Last error: {last_error}")
 
