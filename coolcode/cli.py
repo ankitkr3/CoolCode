@@ -1078,6 +1078,11 @@ def _ensure_path() -> None:
 @click.option("--workers", "-w", default=3, type=int, help="Number of parallel workers")
 @click.option("--consensus", "-c", default="weighted", type=click.Choice(["majority", "weighted", "raft", "byzantine", "gossip"]), help="Consensus algorithm")
 @click.option("--verbose", "-v", is_flag=True, help="Enable debug logging")
+@click.option(
+    "--project-memory",
+    is_flag=True,
+    help="Isolate memory per project (<cwd>/.coolcode/). Default is global (~/.coolcode/) so memory follows you across projects.",
+)
 def main(
     task: str | None,
     provider: str | None,
@@ -1085,12 +1090,17 @@ def main(
     workers: int,
     consensus: str,
     verbose: bool,
+    project_memory: bool,
 ) -> None:
     """Cool Code — the smarter CLI coding agent with swarm intelligence."""
     _setup_logging(verbose)
 
     # Auto-fix PATH on first run so `coolcode` works in future sessions
     _ensure_path()
+
+    # Memory scope must be set before CoolCodeConfig.from_env reads the env var.
+    if project_memory:
+        os.environ["COOLCODE_PROJECT_MEMORY"] = "1"
 
     config = CoolCodeConfig.from_env(project_dir=os.getcwd())
     config.swarm.num_workers = workers

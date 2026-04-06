@@ -44,9 +44,17 @@ class LearningBridge:
         collective_memory: CollectiveMemory | None = None,
         knowledge_graph: KnowledgeGraph | None = None,
         vector_store: VectorStore | None = None,
+        coolcode_dir: Path | str | None = None,
     ):
         self._project_dir = Path(project_dir)
-        coolcode_dir = self._project_dir / ".coolcode"
+        # ``coolcode_dir`` is the effective memory root — defaults to the
+        # project's ``.coolcode`` dir when not supplied, but callers (Swarm)
+        # pass the global ``~/.coolcode`` path so memory follows the user
+        # across projects.
+        if coolcode_dir is None:
+            coolcode_dir = self._project_dir / ".coolcode"
+        coolcode_dir = Path(coolcode_dir)
+        coolcode_dir.mkdir(parents=True, exist_ok=True)
 
         self.collective = collective_memory or CollectiveMemory(
             str(coolcode_dir / "memory.db")

@@ -70,9 +70,19 @@ class SwarmConfig:
 
 @dataclass
 class MemoryConfig:
-    """Configuration for the memory system."""
+    """Configuration for the memory system.
+
+    Memory is global-by-default: conversation history, knowledge graph,
+    collective SQLite memory, vector store, and learnings all live in
+    ``~/.coolcode/`` so that launching Cool Code from a new cwd does NOT
+    start with empty memory. Set ``global_memory=False`` (CLI
+    ``--project-memory``) to fall back to the old per-project layout for
+    isolated/sensitive repositories.
+    """
 
     sqlite_path: str = ""
+    memory_dir: str = ""  # resolved at load time — global or project .coolcode dir
+    global_memory: bool = True
     vector_dim: int = 384  # MiniLM embedding dimension
     vector_max_elements: int = 100_000
     lru_cache_size: int = 1024
@@ -157,12 +167,22 @@ class CoolCodeConfig:
             providers = saved_providers
 
         project_path = Path(project_dir).resolve()
-        sqlite_path = str(project_path / ".coolcode" / "memory.db")
+
+        # Global-by-default memory: store under ~/.coolcode/ so memory follows
+        # the user across projects. Set COOLCODE_PROJECT_MEMORY=1 (or pass
+        # --project-memory on the CLI) to isolate memory per project.
+        use_global = os.getenv("COOLCODE_PROJECT_MEMORY", "").lower() not in ("1", "true", "yes")
+        memory_root = Path.home() / ".coolcode" if use_global else project_path / ".coolcode"
+        sqlite_path = str(memory_root / "memory.db")
 
         return cls(
             project_dir=str(project_path),
             providers=providers,
-            memory=MemoryConfig(sqlite_path=sqlite_path),
+            memory=MemoryConfig(
+                sqlite_path=sqlite_path,
+                memory_dir=str(memory_root),
+                global_memory=use_global,
+            ),
         )
 
     def get_provider(self, name: str | None = None) -> LLMConfig:

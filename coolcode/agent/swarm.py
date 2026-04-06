@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import logging
 from pathlib import Path
 from typing import Any
@@ -61,20 +62,29 @@ class Swarm:
             persist_path=str(Path.home() / ".coolcode" / "learnings.json")
         )
 
-        # Memory systems
+        # Memory systems — global-by-default, fall back to project dir if opted out.
         project_dir = config.project_dir
+        memory_dir = Path(config.memory.memory_dir or (Path.home() / ".coolcode"))
+        memory_dir.mkdir(parents=True, exist_ok=True)
+        self._memory_dir = memory_dir
+
         self.knowledge_graph = knowledge_graph or KnowledgeGraph(
-            persist_path=str(Path(project_dir) / ".coolcode" / "knowledge_graph.json")
+            persist_path=str(memory_dir / "knowledge_graph.json")
         )
         self.scoped_memory = scoped_memory or ScopedMemory(project_dir)
         self.learning_bridge = LearningBridge(
             project_dir=project_dir,
             collective_memory=self.collective_memory,
             knowledge_graph=self.knowledge_graph,
+            coolcode_dir=memory_dir,
         )
 
-        # Conversation history — persisted across sessions
-        self._history_path = Path(config.project_dir) / ".coolcode" / "conversation_history.json"
+        # Conversation history — persisted across sessions. Primary store is
+        # ``memory_dir`` (global by default). We also merge any legacy
+        # per-project history file so users who predate global memory don't
+        # lose context the first time they launch with the new default.
+        self._history_path = memory_dir / "conversation_history.json"
+        self._legacy_history_path = Path(project_dir) / ".coolcode" / "conversation_history.json"
         self._conversation_history: list[dict[str, str]] = self._load_history()
 
         # In-process controls — set by CLI during execution
@@ -137,18 +147,45 @@ class Swarm:
         self.status.emit("user", "info added", text[:80])
 
     def _load_history(self) -> list[dict[str, str]]:
-        """Load conversation history from disk."""
-        try:
-            if self._history_path.exists():
-                data = json.loads(self._history_path.read_text())
-                # Keep last 100 exchanges to prevent unbounded growth
-                return data[-100:]
-        except (json.JSONDecodeError, IOError, KeyError):
-            pass
-        return []
+        """Load conversation history, merging global + legacy per-project files.
+
+        Entries are deduped by ``(role, content, ts)`` and sorted by ``ts``.
+        We merge so users upgrading from per-project memory keep everything
+        they had, and the next save consolidates it all into the global file.
+        """
+        merged: list[dict[str, str]] = []
+        seen: set[tuple] = set()
+
+        def _read(path: Path) -> list[dict[str, str]]:
+            try:
+                if path.exists():
+                    data = json.loads(path.read_text())
+                    if isinstance(data, list):
+                        return data
+            except (json.JSONDecodeError, IOError, KeyError) as e:
+                logger.debug(f"Could not read history from {path}: {e}")
+            return []
+
+        sources = [self._history_path]
+        if self._legacy_history_path != self._history_path:
+            sources.append(self._legacy_history_path)
+
+        for src in sources:
+            for entry in _read(src):
+                if not isinstance(entry, dict):
+                    continue
+                key = (entry.get("role", ""), entry.get("content", "")[:200], entry.get("ts", 0))
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(entry)
+
+        merged.sort(key=lambda e: e.get("ts", 0))
+        # Keep last 100 exchanges to prevent unbounded growth
+        return merged[-100:]
 
     def _save_history(self) -> None:
-        """Persist conversation history to disk."""
+        """Persist conversation history to disk (global store)."""
         try:
             self._history_path.parent.mkdir(parents=True, exist_ok=True)
             # Keep last 100 exchanges
@@ -408,7 +445,12 @@ class Swarm:
         # Conversation history (persisted) — guarded so concurrent executions don't
         # interleave appends or race on the JSON save.
         async with self._history_lock:
-            self._conversation_history.append({"role": "assistant", "content": final_output[:1000]})
+            self._conversation_history.append({
+                "role": "assistant",
+                "content": final_output[:1000],
+                "ts": time.time(),
+                "project": self.config.project_dir,
+            })
             self._save_history()
 
         # Learning bridge
@@ -447,13 +489,32 @@ class Swarm:
         parts.append(f"[Project Directory: {self.config.project_dir}]")
         parts.append(f"[User Home: {Path.home()}]")
 
-        # YOUR CONVERSATION HISTORY (this session)
+        # YOUR CONVERSATION HISTORY (current project first, then recent global)
         if self._conversation_history:
-            parts.append("\n--- YOUR CONVERSATION HISTORY (this session) ---")
-            for entry in self._conversation_history[-10:]:
-                role = entry["role"].upper()
-                parts.append(f"{role}: {entry['content'][:500]}")
-            parts.append("--- END CONVERSATION HISTORY ---\n")
+            cur_project = self.config.project_dir
+            project_entries = [
+                e for e in self._conversation_history
+                if e.get("project", cur_project) == cur_project
+            ][-10:]
+            global_entries = [
+                e for e in self._conversation_history
+                if e.get("project") and e.get("project") != cur_project
+            ][-5:]
+
+            if project_entries:
+                parts.append("\n--- CONVERSATION HISTORY (this project) ---")
+                for entry in project_entries:
+                    role = entry.get("role", "?").upper()
+                    parts.append(f"{role}: {entry.get('content', '')[:500]}")
+                parts.append("--- END ---\n")
+
+            if global_entries:
+                parts.append("\n--- RECENT CONVERSATION HISTORY (other projects) ---")
+                for entry in global_entries:
+                    role = entry.get("role", "?").upper()
+                    proj = Path(entry.get("project", "")).name or "?"
+                    parts.append(f"[{proj}] {role}: {entry.get('content', '')[:300]}")
+                parts.append("--- END ---\n")
 
         # YOUR MEMORY: similar tasks you've handled before
         similar = self.learning_bridge.semantic_recall(task, k=3)
@@ -508,7 +569,12 @@ class Swarm:
 
         # Add user message to conversation history (persisted)
         async with self._history_lock:
-            self._conversation_history.append({"role": "user", "content": task})
+            self._conversation_history.append({
+                "role": "user",
+                "content": task,
+                "ts": time.time(),
+                "project": self.config.project_dir,
+            })
             self._save_history()
 
         # Build context from memory + history
@@ -677,7 +743,12 @@ class Swarm:
 
         # Add assistant response to conversation history (persisted)
         async with self._history_lock:
-            self._conversation_history.append({"role": "assistant", "content": final_output[:1000]})
+            self._conversation_history.append({
+                "role": "assistant",
+                "content": final_output[:1000],
+                "ts": time.time(),
+                "project": self.config.project_dir,
+            })
             self._save_history()
 
         # Learning bridge — embed task+result for semantic recall
