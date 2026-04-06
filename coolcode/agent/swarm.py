@@ -438,7 +438,7 @@ class Swarm:
                 content=f"Goal: {self._goal}\nTask: {task[:200]}\n"
                 f"Stages: {len(pipeline.stages)}, Workers: {len(all_results)}\n"
                 f"Best: {best_result.worker_id} ({best_result.confidence:.2f})",
-                tags=[self._goal] + [w.value for w in all_worker_types],
+                tags=[self._goal, self._project_tag()] + [w.value for w in all_worker_types],
                 relevance_score=quality,
             )
 
@@ -481,6 +481,16 @@ class Swarm:
             consensus_algorithm=f"goal:{pipeline.name}",
         )
 
+    def _project_tag(self) -> str:
+        """Short, stable tag used to scope collective memory entries.
+
+        Uses a short hash of the project dir so tags stay small even for
+        long paths, while still being unique enough to avoid collisions.
+        """
+        import hashlib
+        h = hashlib.sha1(str(self.config.project_dir).encode()).hexdigest()[:10]
+        return f"proj:{h}"
+
     def _build_context(self, task: str) -> str:
         """Build rich context from conversation history, memory, and project info."""
         parts: list[str] = []
@@ -517,7 +527,14 @@ class Swarm:
                 parts.append("--- END ---\n")
 
         # YOUR MEMORY: similar tasks you've handled before
-        similar = self.learning_bridge.semantic_recall(task, k=3)
+        # When the user opts into --project-memory, recall is strictly
+        # project-local. Otherwise same-project memories still win ties
+        # via the learning bridge's built-in boost.
+        similar = self.learning_bridge.semantic_recall(
+            task,
+            k=3,
+            project_only=not self.config.memory.global_memory,
+        )
         if similar:
             parts.append("\n--- YOUR MEMORY: PAST TASKS YOU'VE HANDLED ---")
             for s in similar:
@@ -530,12 +547,27 @@ class Swarm:
 
         # YOUR MEMORY: insights and learnings from past work
         if self.collective_memory:
-            related = self.collective_memory.search(
-                memory_type=MemoryType.INSIGHT, limit=5, min_relevance=0.3
-            )
-            if related:
+            project_tag = self._project_tag()
+            if self.config.memory.global_memory:
+                # Global mode: pull recent high-relevance insights, then
+                # prefer same-project ones at the top.
+                related = self.collective_memory.search(
+                    memory_type=MemoryType.INSIGHT, limit=10, min_relevance=0.3
+                )
+                same = [m for m in related if project_tag in set(json.loads(m.get("tags", "[]")))]
+                other = [m for m in related if m not in same]
+                ordered = same + other
+            else:
+                # Strict project mode — tag filter.
+                ordered = self.collective_memory.search(
+                    memory_type=MemoryType.INSIGHT,
+                    tags=[project_tag],
+                    limit=5,
+                    min_relevance=0.3,
+                )
+            if ordered:
                 parts.append("\n--- YOUR MEMORY: INSIGHTS FROM PAST WORK ---")
-                for mem in related[:3]:
+                for mem in ordered[:3]:
                     parts.append(f"• {mem['content'][:200]}")
                 parts.append("--- END INSIGHTS ---\n")
 
@@ -737,7 +769,7 @@ class Swarm:
                 memory_type=MemoryType.INSIGHT,
                 content=f"Task: {task[:200]}\nRouted to: {[w.value for w in worker_types]}\n"
                 f"Best worker: {best_result.worker_id} (confidence: {best_result.confidence:.2f})",
-                tags=[w.value for w in worker_types],
+                tags=[self._project_tag()] + [w.value for w in worker_types],
                 relevance_score=quality,
             )
 

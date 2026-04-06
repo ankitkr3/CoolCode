@@ -96,6 +96,7 @@ class LearningBridge:
                 "confidence": confidence,
                 "success": success,
                 "timestamp": time.time(),
+                "project": str(self._project_dir),
             },
         )
 
@@ -134,17 +135,53 @@ class LearningBridge:
         elapsed_ms = (time.monotonic() - start) * 1000
         logger.debug(f"Learning bridge adapted in {elapsed_ms:.2f}ms (total: {self._adaptation_count})")
 
-    def semantic_recall(self, query: str, k: int = 5) -> list[dict[str, Any]]:
+    def semantic_recall(
+        self,
+        query: str,
+        k: int = 5,
+        project_only: bool = False,
+        same_project_boost: float = 1.5,
+    ) -> list[dict[str, Any]]:
         """Find semantically similar past tasks/results.
 
-        Returns list of {text, metadata, distance} sorted by relevance.
+        Args:
+            query: text to match against past tasks.
+            k: number of results to return.
+            project_only: if True, drop any match from a different project
+                (used when the user sets ``--project-memory``).
+            same_project_boost: multiplier applied to the similarity score
+                of same-project matches. Default 1.5 — same-project wins
+                ties but a clearly more similar cross-project memory can
+                still surface.
+
+        Returns list of {text, metadata, distance} sorted by adjusted score.
         """
         if self.vectors.count == 0:
             return []
         embedding = embed_text(query)
-        results = self.vectors.search(embedding, k=k)
+        # Pull more than k so boosting/filtering has room to work.
+        raw = self.vectors.search(embedding, k=max(k * 3, k + 5))
         # Filter out low-quality matches (distance > 0.8 means not very similar)
-        return [r for r in results if r["distance"] < 0.8]
+        raw = [r for r in raw if r.get("distance", 1.0) < 0.8]
+
+        cur_project = str(self._project_dir)
+
+        def _same_project(r: dict[str, Any]) -> bool:
+            return (r.get("metadata") or {}).get("project") == cur_project
+
+        if project_only:
+            raw = [r for r in raw if _same_project(r)]
+
+        # Boost same-project matches. We work in similarity space (1 - distance)
+        # so higher is better, apply the multiplier, then re-sort.
+        def _adjusted(r: dict[str, Any]) -> float:
+            sim = 1.0 - float(r.get("distance", 1.0))
+            if _same_project(r):
+                sim *= same_project_boost
+            return sim
+
+        raw.sort(key=_adjusted, reverse=True)
+        return raw[:k]
 
     def get_influential_entities(self, top_k: int = 10) -> list[tuple[str, float]]:
         """Get the most influential entities from the knowledge graph."""
