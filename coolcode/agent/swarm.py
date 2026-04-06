@@ -79,7 +79,9 @@ class Swarm:
 
         # In-process controls — set by CLI during execution
         self._cancelled = False  # ESC pressed → stop gracefully
+        self._cancel_event = asyncio.Event()  # async cancel signal for workers
         self._injected_context: list[str] = []  # user-typed info mid-execution
+        self._history_lock = asyncio.Lock()  # protects _conversation_history mutations
 
         swarm_cfg = config.swarm
         self.consensus = ConsensusEngine(
@@ -126,6 +128,7 @@ class Swarm:
     def cancel(self) -> None:
         """Cancel the current execution gracefully."""
         self._cancelled = True
+        self._cancel_event.set()
         self.status.emit("swarm", "cancelling", "ruko, band kar rha hoon...")
 
     def inject_context(self, text: str) -> None:
@@ -157,6 +160,7 @@ class Swarm:
     def _reset_execution_state(self) -> None:
         """Reset per-execution state before a new run."""
         self._cancelled = False
+        self._cancel_event = asyncio.Event()  # fresh event per execution
         self._injected_context.clear()
 
     def _record_costs(self, results: list[WorkerResult], task: str = "") -> float:
@@ -192,41 +196,42 @@ class Swarm:
         return total
 
     async def _gather_with_cancel(
-        self, coros: list, poll_interval: float = 0.5
+        self, coros: list, poll_interval: float = 0.2
     ) -> list[WorkerResult]:
-        """Run coroutines concurrently, cancelling all if ESC is pressed.
+        """Run coroutines concurrently; stop all if ESC is pressed.
 
-        Unlike asyncio.gather, this checks self._cancelled periodically and
-        cancels remaining tasks immediately — preventing the hang where workers
-        keep running after ESC because asyncio.to_thread ignores cancellation.
+        Workers now cooperate via self._cancel_event — they check it between
+        astream chunks and return partial results cleanly. This wrapper also
+        hard-cancels any task that doesn't respond within a grace period.
         """
         tasks = [asyncio.ensure_future(c) for c in coros]
-        results: list[WorkerResult | None] = [None] * len(tasks)
 
         while True:
-            # Check for cancellation
             if self._cancelled:
+                # Workers will see _cancel_event and return partial results naturally.
+                # Give them a grace period, then hard-cancel anything still running.
+                self.status.emit("goal", "cancelling", "ruko, workers band kar rha hoon...")
+                try:
+                    await asyncio.wait(tasks, timeout=3.0)
+                except Exception:
+                    pass
                 for t in tasks:
                     if not t.done():
                         t.cancel()
-                self.status.emit("goal", "cancelling", "ruko, workers band kar rha hoon...")
                 break
 
-            # Check if all tasks are done
-            all_done = all(t.done() for t in tasks)
-            if all_done:
+            if all(t.done() for t in tasks):
                 break
 
             await asyncio.sleep(poll_interval)
 
-        # Collect results — cancelled/errored tasks return a timeout result
+        # Collect results — partials preserved, hard-cancels become error results
         final: list[WorkerResult] = []
         for i, t in enumerate(tasks):
             try:
                 if t.done() and not t.cancelled():
                     final.append(t.result())
                 else:
-                    # Task was cancelled or still running — return a cancelled result
                     final.append(WorkerResult(
                         worker_id=f"cancelled-{i}",
                         worker_type=WorkerType.CODER,
@@ -339,7 +344,10 @@ class Swarm:
                 all_worker_types.append(step.worker_type)
 
             # Execute all steps in this stage — with cancellation support
-            coros = [w.execute(stage_context, timeout=step.timeout) for w, step in zip(workers, stage.steps)]
+            coros = [
+                w.execute(stage_context, timeout=step.timeout, cancel_event=self._cancel_event)
+                for w, step in zip(workers, stage.steps)
+            ]
             stage_results = await self._gather_with_cancel(coros)
             self._record_costs(stage_results, task)
             all_results.extend(stage_results)
@@ -593,7 +601,7 @@ class Swarm:
 
         # Step 3: Execute ALL workers in parallel — with cancellation support
         self.status.emit("swarm", "racing", "saare agents lage hue hain...")
-        coros = [w.execute(enriched_task) for w in workers]
+        coros = [w.execute(enriched_task, cancel_event=self._cancel_event) for w in workers]
         results: list[WorkerResult] = await self._gather_with_cancel(coros)
 
         # Record costs from worker results

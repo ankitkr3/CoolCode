@@ -163,73 +163,98 @@ class WorkerAgent:
         if self._status:
             self._status.emit(self.worker_id, action, detail)
 
-    async def execute(self, task: str, timeout: int = 0) -> WorkerResult:
-        """Execute a task and return the result. Uses per-worker-type timeout if not specified."""
+    @staticmethod
+    def _extract_text(msg: Any) -> str:
+        """Best-effort extraction of text content from a langchain message."""
+        if msg is None:
+            return ""
+        content = getattr(msg, "content", "")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            # AIMessage content can be a list of dicts with 'text' or 'type' keys
+            parts = []
+            for item in content:
+                if isinstance(item, dict):
+                    text = item.get("text") or item.get("content") or ""
+                    if text:
+                        parts.append(text)
+                elif isinstance(item, str):
+                    parts.append(item)
+            return "".join(parts)
+        return str(content)
+
+    @staticmethod
+    def _last_text_message(messages: list) -> Any:
+        """Find the last message with non-empty text content (skip tool calls)."""
+        for msg in reversed(messages or []):
+            text = WorkerAgent._extract_text(msg)
+            if text and text.strip():
+                return msg
+        return messages[-1] if messages else None
+
+    async def execute(
+        self,
+        task: str,
+        timeout: int = 0,
+        cancel_event: asyncio.Event | None = None,
+    ) -> WorkerResult:
+        """Execute a task and return the result.
+
+        Streams state updates from the agent so partial output is preserved
+        across timeouts and cancellations. Checks cancel_event between chunks.
+        """
         if timeout <= 0:
             timeout = WORKER_TIMEOUTS.get(self.worker_type, 180)
         self._emit("started", f"working on: {task[:80]}...")
         start = time.monotonic()
+
+        # Running state — preserved on timeout/cancel so we never lose progress
+        latest_state: dict | None = None
+        chunk_count = 0
+        was_cancelled = False
+        was_timeout = False
+
+        async def stream_agent() -> dict | None:
+            nonlocal latest_state, chunk_count, was_cancelled
+            state: dict | None = None
+            try:
+                async for chunk in self._agent.astream(
+                    {"messages": [{"role": "user", "content": task}]},
+                    stream_mode="values",
+                ):
+                    # Save latest full state — each yield is cumulative with stream_mode="values"
+                    state = chunk
+                    latest_state = chunk
+                    chunk_count += 1
+
+                    # Check external cancel between chunks (ESC pressed)
+                    if cancel_event is not None and cancel_event.is_set():
+                        was_cancelled = True
+                        self._emit("cancelling", f"stopped after {chunk_count} chunks")
+                        break
+
+                    # Emit periodic progress
+                    if chunk_count % 3 == 0:
+                        msgs = chunk.get("messages", []) if isinstance(chunk, dict) else []
+                        self._emit(
+                            "streaming",
+                            f"chunk {chunk_count} ({len(msgs)} messages)",
+                        )
+            except asyncio.CancelledError:
+                was_cancelled = True
+                raise
+            return state
+
         try:
             self._emit("thinking", "analyzing the task")
-            result = await asyncio.wait_for(
-                asyncio.to_thread(
-                    self._agent.invoke,
-                    {"messages": [{"role": "user", "content": task}]},
-                ),
-                timeout=timeout,
-            )
-            output = result["messages"][-1].content
-            elapsed = (time.monotonic() - start) * 1000
-
-            # Extract token usage from LLM response metadata
-            usage_meta = {}
-            last_msg = result["messages"][-1]
-            if hasattr(last_msg, "usage_metadata") and last_msg.usage_metadata:
-                usage_meta = dict(last_msg.usage_metadata)
-            elif hasattr(last_msg, "response_metadata"):
-                rm = last_msg.response_metadata or {}
-                if "usage" in rm:
-                    usage_meta = rm["usage"]
-                elif "token_usage" in rm:
-                    usage_meta = rm["token_usage"]
-
-            self._emit("done", f"completed in {elapsed:.0f}ms")
-
-            # Extract confidence from output
-            confidence = 0.8
-            lines = output.strip().split("\n")
-            for line in reversed(lines):
-                if line.strip().startswith("CONFIDENCE:"):
-                    try:
-                        confidence = float(line.split(":", 1)[1].strip())
-                        confidence = max(0.0, min(1.0, confidence))
-                    except ValueError:
-                        pass
-                    break
-
-            return WorkerResult(
-                worker_id=self.worker_id,
-                worker_type=self.worker_type,
-                output=output,
-                confidence=confidence,
-                elapsed_ms=elapsed,
-                metadata={
-                    "input_tokens": usage_meta.get("input_tokens", 0),
-                    "output_tokens": usage_meta.get("output_tokens", 0),
-                },
-            )
+            result = await asyncio.wait_for(stream_agent(), timeout=timeout)
         except (asyncio.TimeoutError, TimeoutError):
-            elapsed = (time.monotonic() - start) * 1000
-            self._emit("timeout", f"timed out after {timeout}s")
-            logger.warning(f"Worker {self.worker_id} timed out after {timeout}s")
-            return WorkerResult(
-                worker_id=self.worker_id,
-                worker_type=self.worker_type,
-                output="",
-                confidence=0.0,
-                elapsed_ms=elapsed,
-                error=f"Timed out after {timeout}s",
-            )
+            was_timeout = True
+            result = latest_state  # Use whatever we got before timeout
+        except asyncio.CancelledError:
+            was_cancelled = True
+            result = latest_state
         except Exception as e:
             elapsed = (time.monotonic() - start) * 1000
             self._emit("failed", str(e)[:100])
@@ -242,3 +267,100 @@ class WorkerAgent:
                 elapsed_ms=elapsed,
                 error=str(e),
             )
+
+        elapsed = (time.monotonic() - start) * 1000
+
+        # Extract output + usage from final (or latest partial) state
+        messages = result.get("messages", []) if isinstance(result, dict) else []
+        last_msg = self._last_text_message(messages)
+        output = self._extract_text(last_msg)
+
+        usage_meta: dict = {}
+        if last_msg is not None:
+            if hasattr(last_msg, "usage_metadata") and last_msg.usage_metadata:
+                usage_meta = dict(last_msg.usage_metadata)
+            elif hasattr(last_msg, "response_metadata"):
+                rm = last_msg.response_metadata or {}
+                if "usage" in rm:
+                    usage_meta = rm["usage"]
+                elif "token_usage" in rm:
+                    usage_meta = rm["token_usage"]
+
+        # Handle timeout/cancel: return partial if we have any, else error
+        if was_timeout:
+            if output:
+                self._emit(
+                    "timeout_partial",
+                    f"timeout after {timeout}s — returning {len(output)} bytes from {chunk_count} chunks",
+                )
+                logger.warning(
+                    f"Worker {self.worker_id} timed out after {timeout}s (returning partial: {len(output)} bytes)"
+                )
+                return WorkerResult(
+                    worker_id=self.worker_id,
+                    worker_type=self.worker_type,
+                    output=output,
+                    confidence=0.3,  # reduced confidence for partial results
+                    elapsed_ms=elapsed,
+                    error=f"Timed out after {timeout}s (partial result)",
+                    metadata={
+                        "input_tokens": usage_meta.get("input_tokens", 0),
+                        "output_tokens": usage_meta.get("output_tokens", 0),
+                        "partial": True,
+                        "chunks": chunk_count,
+                    },
+                )
+            self._emit("timeout", f"timed out after {timeout}s")
+            logger.warning(f"Worker {self.worker_id} timed out after {timeout}s")
+            return WorkerResult(
+                worker_id=self.worker_id,
+                worker_type=self.worker_type,
+                output="",
+                confidence=0.0,
+                elapsed_ms=elapsed,
+                error=f"Timed out after {timeout}s",
+            )
+
+        if was_cancelled:
+            self._emit("cancelled", f"stopped after {chunk_count} chunks")
+            return WorkerResult(
+                worker_id=self.worker_id,
+                worker_type=self.worker_type,
+                output=output,
+                confidence=0.2 if output else 0.0,
+                elapsed_ms=elapsed,
+                error="Cancelled by user",
+                metadata={
+                    "input_tokens": usage_meta.get("input_tokens", 0),
+                    "output_tokens": usage_meta.get("output_tokens", 0),
+                    "partial": bool(output),
+                    "chunks": chunk_count,
+                },
+            )
+
+        self._emit("done", f"completed in {elapsed:.0f}ms")
+
+        # Extract confidence marker from output
+        confidence = 0.8
+        lines = output.strip().split("\n") if output else []
+        for line in reversed(lines):
+            if line.strip().startswith("CONFIDENCE:"):
+                try:
+                    confidence = float(line.split(":", 1)[1].strip())
+                    confidence = max(0.0, min(1.0, confidence))
+                except ValueError:
+                    pass
+                break
+
+        return WorkerResult(
+            worker_id=self.worker_id,
+            worker_type=self.worker_type,
+            output=output,
+            confidence=confidence,
+            elapsed_ms=elapsed,
+            metadata={
+                "input_tokens": usage_meta.get("input_tokens", 0),
+                "output_tokens": usage_meta.get("output_tokens", 0),
+                "chunks": chunk_count,
+            },
+        )
